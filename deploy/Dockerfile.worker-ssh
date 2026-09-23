@@ -1,0 +1,8 @@
+# A worker that acts on a host through SSH: the airlock image plus the ssh
+# client. What it may do there is decided on the host, by the forced command
+# its key is bound to in authorized_keys (deploy/host/airlock-maint).
+ARG BASE=airlock:0.1
+FROM ${BASE}
+USER 0
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-client && rm -rf /var/lib/apt/lists/*
+USER 10001
