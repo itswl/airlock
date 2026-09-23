@@ -15,6 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 claude = ["claude-agent-sdk>=0.2.158"]  # the version run for real; it bundles the Claude Code CLI
+feishu = ["lark-oapi>=1.4"]  # airlock.extras.feishu: the long connection for replies
 dev = ["pytest>=8", "ruff>=0.6"]
 
 [project.scripts]

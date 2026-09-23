@@ -201,7 +201,6 @@ def lay_out(root: Path, port: int, real: dict[str, str] | None = None, *, code: 
         "state/infra",
         "state/code",
         "creds/investigator-infra",
-        "code",
         "profiles/skills-infra",
         "data/mcp-gate",
         "repos",

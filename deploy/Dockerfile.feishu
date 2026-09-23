@@ -1,0 +1,8 @@
+# The Feishu / Lark adapter (airlock/extras/feishu): the airlock image plus the platform's SDK,
+# which holds the application's one long connection for replies.
+ARG BASE=airlock:0.1
+FROM ${BASE}
+USER 0
+RUN pip install --no-cache-dir 'lark-oapi>=1.4'
+USER 10001
+CMD ["python", "-m", "airlock.extras.feishu", "--config", "/etc/airlock/feishu.yaml", "--host", "0.0.0.0", "--port", "9100"]

@@ -1,0 +1,7 @@
+# The mirrors (airlock/extras/mirrors). Copy to mirrors.yaml next to compose.yml.
+root: /repos
+every_minutes: 15
+username: x-access-token                      # GitHub; the password is the token
+token_env: AIRLOCK_MIRRORS_TOKEN              # read-only: a fine-grained token with Contents: Read on these repositories
+repos:
+  - {name: payments-api, url: "https://github.com/example/payments-api.git"}

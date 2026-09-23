@@ -1,0 +1,13 @@
+# Added to deploy/compose.yml by scripts/extras_smoke.py only: a made-up chat platform and a stand-in
+# for the chat's webhook. Nothing here belongs in a deployment.
+services:
+  fake-chat:
+    image: ${AIRLOCK_IMAGE:-airlock:0.1}
+    command: [python, /smoke/fake_chat.py]
+    volumes: ["./smoke:/smoke:ro"]
+    networks: [outside]
+  sink:
+    image: ${AIRLOCK_IMAGE:-airlock:0.1}
+    command: [python, /smoke/sink.py]
+    volumes: ["./smoke:/smoke:ro", "${AIRLOCK_ROOT:-/opt/airlock}/data/sink:/records"]
+    networks: [outside]

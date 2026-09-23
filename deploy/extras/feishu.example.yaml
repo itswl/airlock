@@ -1,0 +1,18 @@
+# The Feishu / Lark adapter (airlock/extras/feishu). Copy to feishu.yaml next to compose.yml.
+name: feishu                                  # the adapter's name in airlock's config (adapters: - name: feishu)
+brand: lark                                   # feishu or lark
+app_id_env: AIRLOCK_FEISHU_APP_ID             # the application (one per adapter: Lark allows one long connection per app)
+app_secret_env: AIRLOCK_FEISHU_APP_SECRET
+# webhook_url_env: AIRLOCK_FEISHU_WEBHOOK     # instead of an application: a custom bot, send only, no replies
+plans_chat_env: AIRLOCK_FEISHU_PLANS_CHAT     # plans, reports and results; one thread per work item
+notices_chat_env: AIRLOCK_FEISHU_NOTICES_CHAT # the watcher's signals
+subscription_secret_env: AIRLOCK_SUB_FEISHU_SECRET   # = the feishu subscription's secret in airlock's config
+notice_secret_env: AIRLOCK_WATCH_NOTICE_SECRET       # = the watcher's notes secret
+people_env: AIRLOCK_FEISHU_PEOPLE             # open ids that may speak through the adapter (comma-separated)
+airlock:
+  adapter_url: http://control:8080/v1/adapters/feishu
+  adapter_secret_env: AIRLOCK_ADAPTER_FEISHU_SECRET  # = the feishu adapter's secret in airlock's config
+  intake_url: http://control:8080/v1/intake/feishu   # new topics and replies under notes become work items
+  intake_secret_env: AIRLOCK_FEISHU_INTAKE_SECRET    # = the feishu source's secret in airlock's config
+  console_url: http://127.0.0.1:8080          # where you open the console; cards link to it
+state: /state/feishu.db

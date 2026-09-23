@@ -9,14 +9,21 @@
 #   DOCKER_GID             the group that owns the Docker socket (0 on Docker Desktop / OrbStack)
 #   AIRLOCK_EGRESS_ALLOW   the hosts investigators may reach through the proxy (the model gateway among them)
 #   AIRLOCK_INFRA_MCP_ALLOWED  the MCP tools the infra investigator may call, e.g. mcp__alerts__get_*,mcp__alerts__list_*
-#   COMPOSE_PROFILES=mcp-gate  also start the MCP gateway (mcp-gate.json, mcp-gate.env; see airlock/mcpgate.py)
+#   COMPOSE_PROFILES           which optional pieces start, comma-separated:
+#     mcp-gate   the MCP gateway (mcp-gate.json, mcp-gate.env; airlock/mcpgate.py)
+#     watch      the watcher, a source (watch.yaml, watch.env, profiles/watch-brief.md; airlock/extras/watch)
+#     feishu     the chat adapter, a subscriber (feishu.yaml, feishu.env; airlock/extras/feishu)
+#     selfcheck  health, the model and the watcher's clock, alarmed on its own road (selfcheck.yaml, selfcheck.env)
+#     mirrors    the repositories investigators read and workers change (mirrors.yaml, mirrors.env)
+#   The optional pieces run as uid 10001: create their state directories for that uid.
 #
-# Five networks, so that who can reach whom is the diagram, not a hope:
-#   investigate  control plane <-> investigators
+# Six networks, so that who can reach whom is the diagram, not a hope:
+#   investigate  control plane <-> investigators, and the watcher -> the intake
 #   launch       control plane <-> launcher          (investigators cannot reach the launcher at all)
-#   egress       investigators  -> egress proxy      (their only way out)
-#   tools        investigators  -> MCP gateway       (only the investigators that use it)
-#   outside      control plane, the proxy and the MCP gateway (webhooks in and out, allowlisted egress, MCP servers)
+#   egress       investigators and the watcher -> egress proxy (their only way out)
+#   tools        investigators and the watcher -> MCP gateway (only those that use it)
+#   edge         the watcher -> the chat adapter's notice door
+#   outside      control plane, proxy, MCP gateway, chat adapter, mirrors (webhooks, allowlisted egress, the platforms)
 # Worker containers are started by the launcher through the Docker socket, on
 # the network each worker profile names; create those networks yourself.
 
@@ -27,6 +34,7 @@ networks:
   launch: {internal: true}
   egress: {internal: true}
   tools: {internal: true}
+  edge: {internal: true}
   outside: {}
 
 services:
@@ -108,7 +116,7 @@ services:
       NO_PROXY: control
     env_file: investigator-code.env
     volumes:
-      - ${AIRLOCK_ROOT:-/opt/airlock}/code:/work/code:ro   # the repositories it reads; the :ro is the boundary
+      - ${AIRLOCK_ROOT:-/opt/airlock}/repos:/work/code:ro   # the mirrors it reads (the mirrors service); the :ro is the boundary
       - ${AIRLOCK_ROOT:-/opt/airlock}/work/code:/work
       - ${AIRLOCK_ROOT:-/opt/airlock}/state/code:/state
     read_only: true
@@ -135,7 +143,92 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
+    extra_hosts: ["host.docker.internal:host-gateway"]   # for a server that runs on the host, like a desktop chat app's
     networks: [tools, outside]
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- around the core (airlock/extras)
+  # Each is a source or a subscriber: it talks to the core only through its doors.
+
+  # A source. Scans the chat (through mcp-gate) and Jira on a schedule; a model with no
+  # tools of its own judges; this process signs: tasks to the intake, notes to the adapter.
+  watch:
+    image: ${AIRLOCK_INVESTIGATOR_IMAGE:-airlock-investigator:0.1}   # the SDK, for the judge
+    profiles: [watch]
+    command: [python, -m, airlock.extras.watch, --config, /etc/airlock/watch.yaml]
+    env_file:
+      - path: watch.env                # model settings; AIRLOCK_WATCH_* secrets and the names that are yours
+        required: false
+    environment:
+      HTTPS_PROXY: http://egress:8888
+      HTTP_PROXY: http://egress:8888
+      NO_PROXY: control,mcp-gate,feishu
+    volumes:
+      - ./watch.yaml:/etc/airlock/watch.yaml:ro
+      - ./profiles/watch-brief.md:/etc/airlock/watch-brief.md:ro
+      - ${AIRLOCK_ROOT:-/opt/airlock}/state/watch:/state
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [investigate, egress, tools, edge]
+    restart: unless-stopped
+
+  # A subscriber and an adapter: the outlet's notifications as cards, replies back as your
+  # messages. It dials out to the platform; nothing inbound needs a public route.
+  feishu:
+    image: ${AIRLOCK_FEISHU_IMAGE:-airlock-feishu:0.1}   # deploy/Dockerfile.feishu
+    profiles: [feishu]
+    command: [python, -m, airlock.extras.feishu, --config, /etc/airlock/feishu.yaml, --host, 0.0.0.0, --port, "9100"]
+    env_file:
+      - path: feishu.env               # the application's id and secret, the doors' secrets, the chats, the people
+        required: false
+    volumes:
+      - ./feishu.yaml:/etc/airlock/feishu.yaml:ro
+      - ${AIRLOCK_ROOT:-/opt/airlock}/state/feishu:/state
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [outside, edge]
+    restart: unless-stopped
+
+  # The road around everything else: health endpoints, one-token model calls, the watcher's
+  # clock. Alarms through its own custom bot webhook, never through the adapter above.
+  selfcheck:
+    image: ${AIRLOCK_IMAGE:-airlock:0.1}
+    profiles: [selfcheck]
+    command: [python, -m, airlock.extras.selfcheck, --config, /etc/airlock/selfcheck.yaml]
+    env_file:
+      - path: selfcheck.env            # the alarm webhook; the model settings the model check uses
+        required: false
+    volumes:
+      - ./selfcheck.yaml:/etc/airlock/selfcheck.yaml:ro
+      - ${AIRLOCK_ROOT:-/opt/airlock}/state/watch:/watch:ro
+      - ${AIRLOCK_ROOT:-/opt/airlock}/state/selfcheck:/state
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [investigate, launch, tools, edge, outside]
+    restart: unless-stopped
+
+  # Fresh mirrors of the repositories: the code investigator reads them (read-only), and
+  # workers with `repos` clone them for every run. A read-only token, never on a command line.
+  mirrors:
+    image: ${AIRLOCK_INVESTIGATOR_IMAGE:-airlock-investigator:0.1}   # has git
+    profiles: [mirrors]
+    command: [python, -m, airlock.extras.mirrors, --config, /etc/airlock/mirrors.yaml]
+    env_file:
+      - path: mirrors.env              # AIRLOCK_MIRRORS_TOKEN
+        required: false
+    volumes:
+      - ./mirrors.yaml:/etc/airlock/mirrors.yaml:ro
+      - ${AIRLOCK_ROOT:-/opt/airlock}/repos:/repos
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [outside]
     restart: unless-stopped
 
   egress:

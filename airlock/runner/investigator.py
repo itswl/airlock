@@ -31,6 +31,9 @@ Configuration is the environment, because a node is a container:
                                outside the working directory, or under its .claude/ (see airlock.runner.mcp)
     AIRLOCK_MCP_ALLOWED        comma-separated MCP tools this profile may call: mcp__<server>__<tool>, or a
                                pattern inside one server (mcp__<server>__*, mcp__<server>__get_*)
+    AIRLOCK_BUDGET_USD         what this node may spend in the window before it refuses new work (see
+                               airlock.runner.budget); AIRLOCK_BUDGET_WINDOW_HOURS (default 24)
+    AIRLOCK_PRICE_{IN,OUT,CACHE_READ,CACHE_WRITE}_PER_1M   token rates: every turn is priced from its usage
     AIRLOCK_SKILLS             "all" or comma-separated names; skills live in <workdir>/.claude/skills
     AIRLOCK_MAX_CONCURRENT     investigations at once (default 2)
     AIRLOCK_MODEL              model name for the claude engine
@@ -51,7 +54,7 @@ import logging
 import os
 import time
 from collections.abc import AsyncIterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +65,7 @@ from fastapi.responses import JSONResponse
 
 from airlock import __version__
 from airlock.crypto import PROFILE_HEADER, SignatureError, canonical_json, sign, verify
+from airlock.runner.budget import Budget, Rates, rates_from
 from airlock.runner.engine import CONSULT_TOOL, Engine, EngineRequest, StubEngine, StubTurn, ToolPolicy
 from airlock.runner.guard import READONLY
 from airlock.runner.mcp import McpConfigError, load_mcp_servers, safe_location
@@ -117,6 +121,9 @@ class NodeConfig:
     skills: tuple[str, ...] = ()
     state_dir: Path | None = None
     stub_reply: Path | None = None
+    budget_usd: float | None = None
+    budget_window_hours: float = 24.0
+    rates: Rates = field(default_factory=Rates)
 
 
 def load_node(env: Mapping[str, str] | None = None) -> NodeConfig:
@@ -153,6 +160,9 @@ def load_node(env: Mapping[str, str] | None = None) -> NodeConfig:
         skills=tuple(s.strip() for s in env.get("AIRLOCK_SKILLS", "").split(",") if s.strip()),
         state_dir=Path(env["AIRLOCK_STATE_DIR"]) if env.get("AIRLOCK_STATE_DIR") else None,
         stub_reply=Path(env["AIRLOCK_STUB_REPLY_FILE"]) if env.get("AIRLOCK_STUB_REPLY_FILE") else None,
+        budget_usd=float(env["AIRLOCK_BUDGET_USD"]) if env.get("AIRLOCK_BUDGET_USD") else None,
+        budget_window_hours=float(env.get("AIRLOCK_BUDGET_WINDOW_HOURS") or 24),
+        rates=rates_from(env),
     )
 
 
@@ -311,6 +321,12 @@ class InvestigatorNode:
         self.running: dict[str, asyncio.Task[None]] = {}
         self.posture: list[dict[str, Any]] = []
         self.ready = not config.posture_checks
+        self.budget = Budget(
+            self.state / "spend.jsonl",
+            limit_usd=config.budget_usd,
+            window_hours=config.budget_window_hours,
+            rates=config.rates,
+        )
 
     def _load_sessions(self) -> dict[str, str]:
         try:
@@ -410,6 +426,10 @@ class InvestigatorNode:
             try:
                 consultable = tuple(str(n) for n in payload.get("consultable") or ())
                 mcp_allowed = self.config.mcp_allowed | ({CONSULT_TOOL} if consultable else set())
+                refusal = self.budget.refusal()
+                if refusal is not None:
+                    await self._post("/v1/investigations/error", {"work_id": work_id, "error": refusal})
+                    return
                 session, fork = self._session_for(work_id, payload.get("session") or {})
                 request = EngineRequest(
                     prompt=investigation_prompt(payload),
@@ -426,6 +446,7 @@ class InvestigatorNode:
                     context=payload,
                 )
                 result = await self.engine.run(request, self._policy(work_id, request.mcp_allowed))
+                cost, priced_by = self.budget.charge(f"investigation {work_id}", result.cost_usd, result.usage)
                 if result.session:
                     self.sessions[work_id] = result.session
                     self._save_sessions()
@@ -437,7 +458,9 @@ class InvestigatorNode:
                         {
                             "work_id": work_id,
                             "text": result.text,
-                            "cost_usd": result.cost_usd,
+                            "cost_usd": cost,
+                            "cost_priced_by": priced_by,
+                            "cost_cli_usd": result.cost_usd,
                             "turns": result.turns,
                             "refusals": result.refusals,
                             "usage": dict(result.usage or {}),
@@ -457,6 +480,9 @@ class InvestigatorNode:
         if not self.ready:
             return 503, {"reason": "posture checks failed"}
         work_id = str(payload.get("work_id") or "")
+        refusal = self.budget.refusal()
+        if refusal is not None:
+            return 200, {"answer": refusal, "cost_usd": 0.0, "turns": 0, "usage": {}}
         # Questions about one work item continue one conversation on this side
         # too; a different work item never shares it.
         consult_key = f"consult:{work_id}"
@@ -474,12 +500,13 @@ class InvestigatorNode:
         )
         async with self.semaphore:
             result = await self.engine.run(request, self._policy(f"consult-{work_id}", request.mcp_allowed))
+        cost, _ = self.budget.charge(f"consult {work_id}", result.cost_usd, result.usage)
         if result.session:
             self.sessions[consult_key] = result.session
             self._save_sessions()
         return 200, {
             "answer": result.text or (result.error or "no answer"),
-            "cost_usd": result.cost_usd,
+            "cost_usd": cost,
             "turns": result.turns,
             "usage": dict(result.usage or {}),
         }
@@ -517,7 +544,13 @@ def create_node_app(node: InvestigatorNode) -> FastAPI:
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
-        body = {"ok": node.ready, "profile": node.config.profile, "posture": node.posture, "running": len(node.running)}
+        body = {
+            "ok": node.ready,
+            "profile": node.config.profile,
+            "posture": node.posture,
+            "running": len(node.running),
+            "budget": node.budget.status(),
+        }
         return JSONResponse(body, status_code=200 if node.ready else 503)
 
     @app.post("/investigate")

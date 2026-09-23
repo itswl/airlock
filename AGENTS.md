@@ -20,6 +20,11 @@ must keep that true. Before you touch anything, know which side you are on.
 - **Records live outside what they record.** The executor streams; the
   launcher keeps. Do not add a path where a worker container writes the
   authoritative record of its own run.
+- **The core does not depend on what surrounds it.** `airlock/extras/` (the
+  watcher, the chat adapter, the self-check, the mirrors) talks to the core only
+  through its doors: intake, outlet, adapter endpoints, health. No core module
+  imports it (`tests/test_extras.py`). A feature that needs the core to know an
+  extra exists is a change to a door, made for every caller.
 - **A workspace stays the worker's after it exits.** The launcher reads a
   worker's workspace as plain files and never runs git (or anything) in it:
   its `.git/config` can name programs, and the launcher sits next to the
@@ -35,8 +40,10 @@ must keep that true. Before you touch anything, know which side you are on.
   one worker holding a real credential: the forced-command SSH key of
   `deploy/host/`. A task-mode worker has run a real model in its container
   and changed a repository (`scripts/compose_smoke.py --code`, on DeepSeek).
-  Cloud identities (AWS, K8s) have not run. A change there is not verified
-  until it has run for real, and a PR says which.
+  The extras have run together in compose with a real model on a made-up chat
+  (`scripts/extras_smoke.py`); a real Feishu application, a real chat platform
+  and a real Jira have not. Cloud identities (AWS, K8s) have not run. A change
+  there is not verified until it has run for real, and a PR says which.
 - **A real model reads nothing it should not send.** Outside a container a real
   engine runs confined, in a working directory outside every repository, with
   a curated environment. What a tool reads is sent to the model provider.

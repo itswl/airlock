@@ -1,0 +1,36 @@
+# The watcher (airlock/extras/watch). Copy to watch.yaml next to compose.yml.
+# Every value that is a secret or a name of yours can be `<key>_env: VARIABLE` instead.
+name: watch
+state_dir: /state
+brief_file: /etc/airlock/watch-brief.md       # profiles/watch-brief.md: what is worth your attention
+schedule:
+  every_minutes: 20                           # :00 :20 :40 on the wall clock
+  window: "09:30-19:30"                       # your working hours
+  days: "1-5"                                 # 1 = Monday
+  tz: Asia/Singapore
+chat:
+  url: http://mcp-gate:8097/chat/             # the chat platform's MCP server, behind the gateway
+  token_env: AIRLOCK_WATCH_CHAT_TOKEN         # the gateway's client token for the watcher
+  tool_prefix_env: AIRLOCK_WATCH_CHAT_PREFIX  # the platform's own tool prefix: an internal name, kept out of files
+  me_env: AIRLOCK_WATCH_ME                    # your display name: your own messages are not signals
+  bots_env: AIRLOCK_WATCH_BOTS                # comma-separated
+  exclude_env: AIRLOCK_WATCH_EXCLUDE          # conversations never read
+  batch_feeds_env: AIRLOCK_WATCH_BATCH_FEEDS  # high-volume conversations, handed over once per batch
+  batch_minutes: 60
+jira:                                         # optional
+  site_env: AIRLOCK_WATCH_JIRA_SITE           # https://<yours>.atlassian.net
+  email_env: AIRLOCK_WATCH_JIRA_EMAIL
+  token_env: AIRLOCK_WATCH_JIRA_TOKEN         # a read-only account is enough
+  project_env: AIRLOCK_WATCH_JIRA_PROJECT
+  mention_env: AIRLOCK_WATCH_JIRA_MENTION     # optional: match comments mentioning you
+  tz: Asia/Hong_Kong                          # the Jira account's own zone
+judge:
+  mcp_config: /etc/airlock/watch-mcp.json     # the chat's read tools for context: {"mcpServers": {"chat": {...}}}
+  mcp_allowed: ["mcp__chat__*"]
+  max_budget_usd: 0.5
+tasks:                                        # a task becomes a work item
+  url: http://control:8080/v1/intake/watch
+  secret_env: AIRLOCK_WATCH_SECRET            # = the watch source's secret in airlock's config
+notes:                                        # a note becomes a card, and so does every task
+  url: http://feishu:9100/notice
+  secret_env: AIRLOCK_WATCH_NOTICE_SECRET     # = the adapter's notice_secret

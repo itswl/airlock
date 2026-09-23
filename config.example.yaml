@@ -89,6 +89,22 @@ sources:
     continue_seconds: 21600
     labels: [alert]
 
+  # The watcher (airlock/extras/watch) posts its tasks here; its notes go to the chat adapter.
+  - name: watch
+    verify: hmac
+    secret_env: AIRLOCK_WATCH_SECRET
+    accept: [{}]
+    map: {title: "{title}", body: "{detail}\n\n来源：{origin}", key: "{key}"}
+    labels: [watch]
+
+  # The chat adapter (airlock/extras/feishu): a new topic, or a reply under a watcher's note, becomes work.
+  - name: feishu
+    verify: hmac
+    secret_env: AIRLOCK_FEISHU_INTAKE_SECRET
+    accept: [{}]
+    map: {title: "{title}", body: "{detail}", key: "{key}"}
+    labels: [chat]
+
 # ---------------------------------------------------------------- routing: first match wins
 routes:
   - when: {source: [github, jira]}
@@ -200,10 +216,11 @@ workers:
 # run.finished, run.failed, run.refused, run.cancelled, approval.expired,
 # approval.revoked, work.rejected, work.closed, work.error, ledger.checkpoint.
 subscriptions:
-  - name: lark
-    url: http://lark-adapter:9000/airlock
-    secret_env: AIRLOCK_SUB_LARK_SECRET
-    events: [plan.ready, plan.revised, plan.invalid, work.answered, run.finished, run.failed, run.refused, work.error]
+  - name: feishu                              # airlock/extras/feishu: cards, one thread per work item
+    url: http://feishu:9100/airlock
+    secret_env: AIRLOCK_SUB_FEISHU_SECRET
+    events: [plan.ready, plan.revised, plan.invalid, work.answered, run.finished, run.failed, run.refused,
+             run.cancelled, work.error, approval.expired, approval.revoked]
   - name: ledger-witness                      # somewhere else keeps every ledger head, so a rewritten ledger shows
     url: https://witness.example.internal/airlock
     secret_env: AIRLOCK_SUB_WITNESS_SECRET
@@ -214,6 +231,6 @@ subscriptions:
 # An adapter posts to /v1/adapters/<name>/message and /decision, signed with its
 # secret, naming the platform user. Only users listed in identities speak for you.
 adapters:
-  - name: lark
-    secret_env: AIRLOCK_ADAPTER_LARK_SECRET
+  - name: feishu
+    secret_env: AIRLOCK_ADAPTER_FEISHU_SECRET
     identities: ["ou_replace_with_your_open_id"]

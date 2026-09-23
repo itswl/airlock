@@ -1,0 +1,16 @@
+# The self-check (airlock/extras/selfcheck). Copy to selfcheck.yaml next to compose.yml.
+every_minutes: 5
+tz: Asia/Singapore                            # the watcher's working hours are read in this zone
+state: /state/selfcheck.json
+alarm:
+  url_env: AIRLOCK_ALARM_WEBHOOK              # a custom bot's webhook: its own road, not the adapter
+  secret_env: AIRLOCK_ALARM_WEBHOOK_SECRET    # when the bot checks signatures
+  repeat_minutes: 60
+checks:
+  - {name: 控制面, url: "http://control:8080/healthz"}
+  - {name: 启动器, url: "http://launcher:8090/healthz"}
+  - {name: 调查员 infra, url: "http://investigator-infra:8100/healthz"}
+  - {name: MCP 网关, url: "http://mcp-gate:8097/healthz"}
+  - {name: 飞书适配器, url: "http://feishu:9100/healthz"}
+  - {name: 盯守, watcher_status: /watch/status.json}
+  - {name: 模型网关, model: true, every_minutes: 60}
