@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}账本 · airlock{% endblock %}
+{% block body %}
+<h1>账本</h1>
+<div class="card">
+  {% if check.intact %}<span class="ok">哈希链完整</span>{% else %}<span class="bad">哈希链在第 {{ check.broken_at }} 条断开</span>{% endif %}
+  <span class="small muted">已校验 {{ check.checked }} 条 · 链头 <code>{{ check.head }}</code></span>
+  <p class="small muted">链头每次执行结束都会作为 ledger.checkpoint 通过外发通知发到订阅方；另存一份链头，事后改账本就能被发现。</p>
+</div>
+<table>
+  <tr><th>#</th><th>时间</th><th>事件</th><th>工作项</th><th>谁</th><th>内容</th></tr>
+  {% for e in entries %}
+  <tr><td>{{ e.seq }}</td><td class="small muted">{{ e.ts|when }}</td><td>{{ e.kind }}</td>
+    <td>{% if e.work_id %}<a href="/work/{{ e.work_id }}">{{ e.work_id }}</a>{% endif %}</td><td>{{ e.actor }}</td>
+    <td><pre class="small">{{ e.data|pretty }}</pre></td></tr>
+  {% endfor %}
+</table>
+{% endblock %}

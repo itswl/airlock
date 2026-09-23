@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}工作项 · airlock{% endblock %}
+{% block body %}
+<h1>等你决定</h1>
+{% if waiting %}
+<table>
+  <tr><th>工作项</th><th>来源</th><th>调查员</th><th>更新</th></tr>
+  {% for w in waiting %}
+  <tr><td><a href="/work/{{ w.id }}">{{ w.title }}</a></td><td>{{ w.source }}</td><td>{{ w.investigator }}</td><td class="small muted">{{ w.updated_at|when }}</td></tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="muted">没有等你批准的方案。</p>
+{% endif %}
+
+<h2>全部工作项</h2>
+<table>
+  <tr><th>工作项</th><th>状态</th><th>来源</th><th>调查员</th><th>备注</th><th>更新</th></tr>
+  {% for w in others %}
+  <tr>
+    <td><a href="/work/{{ w.id }}">{{ w.title }}</a></td>
+    <td><span class="badge s-{{ w.state }}">{{ STATE_LABELS.get(w.state, w.state) }}</span></td>
+    <td>{{ w.source }}</td><td>{{ w.investigator }}</td>
+    <td class="small muted">{{ w.note[:120] }}</td>
+    <td class="small muted">{{ w.updated_at|when }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="6" class="muted">还没有工作项。webhook 进来、或在下面手动提一个。</td></tr>
+  {% endfor %}
+</table>
+
+<h2>手动提一个</h2>
+<div class="card">
+  <form method="post" action="/signals">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <p><input type="text" name="title" placeholder="要调查什么" required></p>
+    <p><textarea name="body" placeholder="背景、现象、你已经知道的"></textarea></p>
+    <button>交给调查员</button>
+  </form>
+</div>
+{% endblock %}

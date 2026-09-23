@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}登录 · airlock{% endblock %}
+{% block body %}
+<div class="card" style="max-width:380px;margin:60px auto">
+  <h1>登录</h1>
+  <p class="muted small">只有你能批准。批准一次，只放行你读到的那一版方案。</p>
+  <form method="post" action="/login">
+    <input type="password" name="password" placeholder="密码" autofocus required>
+    <p><button class="primary">登录</button></p>
+  </form>
+</div>
+{% endblock %}

@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}外发通知 · airlock{% endblock %}
+{% block body %}
+<h1>外发通知</h1>
+<p class="muted small">所有通知都是签名 webhook。飞书、Slack、邮件都只是订阅方之一；发不出去的会重试，最后进死信，原因留在这里。</p>
+<table>
+  <tr><th>#</th><th>时间</th><th>订阅方</th><th>事件</th><th>状态</th><th>尝试</th><th>最后错误</th></tr>
+  {% for r in rows %}
+  <tr><td>{{ r.id }}</td><td class="small muted">{{ r.created_at|when }}</td><td>{{ r.subscription }}</td><td>{{ r.event }}</td>
+    <td>{% if r.status == "dead" %}<span class="bad">死信</span>{% else %}{{ r.status }}{% endif %}</td><td>{{ r.attempts }}</td><td class="small">{{ r.last_error }}</td></tr>
+  {% else %}
+  <tr><td colspan="7" class="muted">还没有通知。</td></tr>
+  {% endfor %}
+</table>
+{% endblock %}

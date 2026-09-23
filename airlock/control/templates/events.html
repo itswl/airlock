@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}接入事件 · airlock{% endblock %}
+{% block body %}
+<h1>接入事件</h1>
+<p class="muted small">每个进管道的 webhook 都在这里：验签失败、被规则过滤、去重合并、没有路由的，都能查到原因。</p>
+<table>
+  <tr><th>时间</th><th>来源</th><th>结果</th><th>原因</th><th>标题</th><th>工作项</th></tr>
+  {% for r in rows %}
+  <tr><td class="small muted">{{ r.received_at|when }}</td><td>{{ r.source }}</td><td>{{ r.outcome }}</td><td class="small">{{ r.reason }}</td>
+    <td>{{ r.title }}</td><td>{% if r.work_id %}<a href="/work/{{ r.work_id }}">{{ r.work_id }}</a>{% endif %}</td></tr>
+  {% else %}
+  <tr><td colspan="6" class="muted">还没有事件。</td></tr>
+  {% endfor %}
+</table>
+{% endblock %}

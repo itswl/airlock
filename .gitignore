@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+/data/
+/runs/
+*.db
+*.db-wal
+*.db-shm
+config.yaml
+.env
+*.egg-info/
+.DS_Store

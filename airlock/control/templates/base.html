@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}airlock{% endblock %}</title>
+{% block head %}{% endblock %}
+<style>
+  :root { --fg:#1d232a; --muted:#66707a; --line:#dde2e7; --bg:#f6f7f9; --ok:#1f7a45; --warn:#9a6700; --bad:#b42318; --accent:#1f5fbf; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.55 -apple-system, "PingFang SC", "Segoe UI", sans-serif; color:var(--fg); background:var(--bg); }
+  header { background:#fff; border-bottom:1px solid var(--line); padding:10px 24px; display:flex; gap:18px; align-items:center; }
+  header .brand { font-weight:700; }
+  header a { color:var(--fg); text-decoration:none; }
+  header form { margin-left:auto; }
+  main { max-width:1100px; margin:0 auto; padding:20px 24px 60px; }
+  h1 { font-size:20px; margin:0 0 6px; } h2 { font-size:16px; margin:26px 0 10px; } h3 { font-size:14px; margin:14px 0 6px; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:8px; padding:16px 18px; margin:12px 0; }
+  .decide { border:2px solid var(--accent); }
+  .muted { color:var(--muted); } .small { font-size:12px; }
+  table { width:100%; border-collapse:collapse; background:#fff; }
+  th, td { text-align:left; padding:7px 9px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { font-weight:600; color:var(--muted); font-size:12px; }
+  code, pre { font-family: ui-monospace, Menlo, monospace; font-size:12.5px; }
+  pre { background:#f1f3f5; padding:10px; border-radius:6px; overflow-x:auto; white-space:pre-wrap; word-break:break-word; margin:6px 0; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; background:#eef1f4; }
+  .s-plan_ready { background:#dbe8ff; color:var(--accent); font-weight:600; }
+  .s-running, .s-approved, .s-investigating, .s-queued { background:#fff4d6; color:var(--warn); }
+  .s-done { background:#dff3e6; color:var(--ok); }
+  .s-failed, .s-refused, .s-error, .s-plan_invalid, .s-cancelled { background:#fde4e1; color:var(--bad); }
+  .risk-high { color:var(--bad); font-weight:700; } .risk-medium { color:var(--warn); font-weight:700; } .risk-low { color:var(--ok); font-weight:700; }
+  .flash { background:#fffbe6; border:1px solid #f0d98c; padding:8px 12px; border-radius:6px; margin-bottom:12px; }
+  button { font:inherit; padding:6px 14px; border-radius:6px; border:1px solid var(--line); background:#fff; cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600; }
+  button.danger { color:var(--bad); border-color:#f2b8b5; }
+  textarea, input[type=text], input[type=password] { width:100%; font:inherit; padding:7px 9px; border:1px solid var(--line); border-radius:6px; }
+  textarea { min-height:70px; }
+  .row { display:flex; gap:10px; align-items:flex-start; flex-wrap:wrap; }
+  .grow { flex:1; min-width:260px; }
+  .msg { border-left:3px solid var(--line); padding:4px 10px; margin:8px 0; }
+  .msg.op { border-color:var(--accent); } .msg.inv { border-color:#8c6bb1; } .msg.sys { border-color:var(--warn); } .msg.src { border-color:#9aa4ae; }
+  details > summary { cursor:pointer; color:var(--accent); }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">airlock</span>
+  {% if csrf %}
+  <a href="/">工作项</a><a href="/ledger">账本</a><a href="/events">接入事件</a><a href="/outbox">外发通知</a>
+  <form method="post" action="/logout"><input type="hidden" name="csrf" value="{{ csrf }}"><button>退出 {{ operator }}</button></form>
+  {% endif %}
+</header>
+<main>
+{% if flash %}<div class="flash">{{ flash }}</div>{% endif %}
+{% block body %}{% endblock %}
+</main>
+</body>
+</html>

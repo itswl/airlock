@@ -1,0 +1,105 @@
+# A sketch of one host running airlock. It has NOT been run as written: read
+# it, adapt it, and check each boundary on your host before trusting it.
+#
+# Four networks, so that who can reach whom is the diagram, not a hope:
+#   investigate  control plane <-> investigators
+#   launch       control plane <-> launcher          (investigators cannot reach the launcher at all)
+#   egress       investigators  -> egress proxy      (their only way out)
+#   outside      control plane and the proxy          (webhooks in and out, allowlisted egress)
+# Worker containers are started by the launcher through the Docker socket, on
+# the network each worker profile names; create those networks yourself.
+
+name: airlock
+
+networks:
+  investigate: {internal: true}
+  launch: {internal: true}
+  egress: {internal: true}
+  outside: {}
+
+services:
+  control:
+    image: airlock:0.1
+    command: [python, -m, airlock.control, --config, /etc/airlock/config.yaml, --host, 0.0.0.0, --port, "8080"]
+    env_file: control.env              # AIRLOCK_SESSION_SECRET, AIRLOCK_OPERATOR_PASSWORD_HASH, AIRLOCK_LAUNCHER_SECRET, source and investigator secrets
+    volumes:
+      - ./config.yaml:/etc/airlock/config.yaml:ro
+      - /opt/airlock/data:/opt/airlock/data
+    ports:
+      - "127.0.0.1:8080:8080"          # put TLS and your SSO / VPN in front; this is the approval button
+    networks: [investigate, launch, outside]
+    restart: unless-stopped
+
+  launcher:
+    image: airlock:0.1
+    command: [python, -m, airlock.launcher, --config, /etc/airlock/config.yaml, --host, 0.0.0.0, --port, "8090"]
+    env_file: launcher.env             # AIRLOCK_LAUNCHER_SECRET only
+    user: "10001:${DOCKER_GID}"        # may use the Docker socket; nothing else here may
+    volumes:
+      - ./config.yaml:/etc/airlock/config.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      # The same path inside and outside: the Docker daemon resolves the run
+      # directory and the credential directories as HOST paths.
+      - /opt/airlock/runs:/opt/airlock/runs
+      - /opt/airlock/data:/opt/airlock/data
+    networks: [launch]
+    restart: unless-stopped
+
+  investigator-infra:
+    image: airlock-investigator:0.1    # FROM airlock:0.1 + 'airlock[claude]' + kubectl + aws CLI
+    command: [python, -m, airlock.runner.investigator, --port, "8100"]
+    environment:
+      AIRLOCK_PROFILE: infra
+      AIRLOCK_CONTROL_URL: http://control:8080
+      AIRLOCK_WORKDIR: /work
+      AIRLOCK_INSTRUCTIONS_FILE: /etc/airlock/infra.md
+      AIRLOCK_POSTURE_FILE: /etc/airlock/posture-infra.yaml
+      HTTPS_PROXY: http://egress:8888
+      HTTP_PROXY: http://egress:8888
+      NO_PROXY: control
+      KUBECONFIG: /creds/kubeconfig
+      AWS_SHARED_CREDENTIALS_FILE: /creds/aws-credentials
+    env_file: investigator-infra.env   # AIRLOCK_SECRET (= AIRLOCK_INVESTIGATOR_INFRA_SECRET), the model API key
+    volumes:
+      - ./profiles/infra.md:/etc/airlock/infra.md:ro
+      - ./profiles/posture-infra.yaml:/etc/airlock/posture-infra.yaml:ro
+      - /opt/airlock/creds/investigator-infra:/creds:ro   # READ-ONLY identities only
+      - /opt/airlock/work/infra:/work
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [investigate, egress]
+    restart: unless-stopped
+
+  investigator-code:
+    image: airlock-investigator:0.1
+    command: [python, -m, airlock.runner.investigator, --port, "8100"]
+    environment:
+      AIRLOCK_PROFILE: code
+      AIRLOCK_CONTROL_URL: http://control:8080
+      AIRLOCK_WORKDIR: /work
+      HTTPS_PROXY: http://egress:8888
+      HTTP_PROXY: http://egress:8888
+      NO_PROXY: control
+    env_file: investigator-code.env
+    volumes:
+      - /opt/airlock/code:/work/code:ro   # the repositories it reads; the :ro is the boundary
+      - /opt/airlock/work/code:/work
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [investigate, egress]
+    restart: unless-stopped
+
+  egress:
+    image: airlock:0.1
+    command: [python, -m, airlock.egress.proxy]
+    environment:
+      EGRESS_ALLOW: api.anthropic.com,.amazonaws.com,api.github.com,github.com
+      EGRESS_PORTS: "443"
+    networks: [egress, outside]
+    read_only: true
+    cap_drop: [ALL]
+    restart: unless-stopped

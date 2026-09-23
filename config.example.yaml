@@ -1,0 +1,190 @@
+# airlock configuration — one file, read by the control plane and by the launcher.
+#
+# Copy to config.yaml (gitignored) and edit. Secrets are never written here:
+# every *_env names an environment variable, and an unset or empty one is a
+# load error, so a door without a secret does not open.
+#
+# Paths under /opt/airlock are placeholders. Put your own.
+
+control:
+  base_url: https://airlock.example.internal   # what links in notifications point at; https makes the cookie Secure
+  db_path: /opt/airlock/data/control.db
+  session_secret_env: AIRLOCK_SESSION_SECRET  # any long random string
+  approval_ttl_seconds: 86400                 # an approval not launched within this is void
+  max_consults: 5                             # per work item
+  max_auto_revisions: 2                       # an invalid plan goes back to its investigator this many times, then you see it
+  investigation_timeout_seconds: 3600         # an investigation that never reports back becomes an error
+
+operator:
+  name: operator                                   # the one person who can approve
+  password_hash_env: AIRLOCK_OPERATOR_PASSWORD_HASH  # python -m airlock.control.passwd
+
+launcher:
+  url: http://launcher:8090                   # the control plane sends approved plans here, and nowhere else
+  secret_env: AIRLOCK_LAUNCHER_SECRET         # shared by the control plane and the launcher only
+  control_url: http://control:8080            # the launcher reports progress and results here
+  db_path: /opt/airlock/data/launcher.db
+  runs_dir: /opt/airlock/runs                 # every run's record; keep it off the workers' mounts
+  runtime: docker                             # docker, or local (no isolation — tests and the demo only)
+
+# ---------------------------------------------------------------- the pipe: where work comes from
+#
+# verify: github        X-Hub-Signature-256, the repository or organisation webhook secret
+#         hub-signature X-Hub-Signature: sha256=… (Jira Cloud webhooks with a secret)
+#         hmac          this system's own X-Airlock-Timestamp / X-Airlock-Signature
+#         bearer        Authorization: Bearer <secret> (Alertmanager, Grafana, anything that can set a header)
+# accept: which events become work; each rule's `when` is matched against the payload plus `event` and `source`.
+# map:    templates over the payload for title, body, url and key; `{a|b}` takes the first that has a value.
+#         Signals with the same key within dedup_seconds join the open work item instead of starting another.
+sources:
+  - name: github
+    verify: github
+    secret_env: AIRLOCK_GITHUB_SECRET
+    accept:
+      - when: {event: issues, action: labeled, label.name: airlock}
+      - when: {event: issue_comment, action: created, comment.body: {regex: "^/airlock\\b"}}
+    map:
+      title: "{issue.title}"
+      body: "{comment.body|issue.body}"
+      url: "{issue.html_url}"
+      key: "{repository.full_name}#{issue.number}"
+    labels: [github]
+
+  - name: jira
+    verify: hub-signature
+    secret_env: AIRLOCK_JIRA_SECRET
+    event_header: null                        # Jira names the event in the body
+    accept:
+      - when: {webhookEvent: "jira:issue_created", issue.fields.labels: airlock}
+    map:
+      title: "{issue.key}: {issue.fields.summary}"
+      body: "{issue.fields.description}"
+      key: "{issue.key}"
+    labels: [jira]
+
+  - name: alertmanager
+    verify: bearer
+    secret_env: AIRLOCK_ALERTMANAGER_TOKEN
+    accept:
+      - when: {status: firing, commonLabels.severity: [critical, page]}
+    map:
+      title: "{commonLabels.alertname}: {commonAnnotations.summary}"
+      body: "{commonAnnotations.description}"
+      url: "{externalURL}"
+      key: "{groupKey}"
+    dedup_seconds: 14400                      # a flapping alert joins the same work item for four hours
+    labels: [alert]
+
+# ---------------------------------------------------------------- routing: first match wins
+routes:
+  - when: {source: [github, jira]}
+    investigator: code
+  - investigator: infra                       # everything else, including what you start from the web page
+
+# ---------------------------------------------------------------- investigators: read-only, standing
+#
+# Each profile is its own container (python -m airlock.runner.investigator) with
+# only its own read-only credentials. It reaches the control plane and nothing
+# else it was not given; the control plane reaches it at `url`.
+investigators:
+  - name: infra
+    url: http://investigator-infra:8100
+    secret_env: AIRLOCK_INVESTIGATOR_INFRA_SECRET
+    may_consult: [code]                       # it may ask code one question at a time, through the control plane
+  - name: code
+    url: http://investigator-code:8100
+    secret_env: AIRLOCK_INVESTIGATOR_CODE_SECRET
+
+# ---------------------------------------------------------------- workers: the only side that writes
+#
+# A worker profile is not a running service. The launcher starts one container
+# per group of consecutive steps, with this profile's credentials only, and
+# deletes it afterwards. The launcher's copy of this list is authoritative.
+#
+# command_allowlist: every commands step's argv, joined with spaces, must fully
+#   match one pattern. Write them narrow; they are the real permission.
+# allowed_permissions: labels a plan may claim for this worker. They are for you
+#   to read at approval time; the credential is what enforces them.
+# posture_checks: run before the first step of every group; any failure and
+#   nothing runs. Use them to prove the credential is the dedicated identity.
+# env: non-secret settings only (they are visible in `docker inspect`); secrets
+#   are files in credentials_dir, mounted read-only at /airlock/creds.
+# network: the Docker network the container joins; none when absent.
+workers:
+  - name: k8s-ops
+    modes: [commands]
+    image: airlock-runner-k8s:latest          # FROM the airlock image, plus kubectl
+    credentials_dir: /opt/airlock/creds/k8s-ops
+    network: airlock-k8s
+    env:
+      KUBECONFIG: /airlock/creds/kubeconfig
+    allowed_permissions: ["k8s:rollout", "k8s:scale"]
+    command_allowlist:
+      - "kubectl -n (payments|checkout) rollout (restart|status) deployment/[a-z0-9-]+( --timeout=[0-9]+s)?"
+      - "kubectl -n (payments|checkout) scale deployment/[a-z0-9-]+ --replicas=([1-9]|1[0-9])"
+      - "kubectl -n (payments|checkout) get (pods|deployments)( -o wide)?"
+    posture_checks:
+      - name: is the dedicated service account
+        argv: [kubectl, auth, whoami, -o, "jsonpath={.status.userInfo.username}"]
+        expect: "^system:serviceaccount:airlock:k8s-ops$"
+      - name: cannot delete namespaces
+        argv: [kubectl, auth, can-i, delete, namespaces]
+        expect: "^no"
+    timeout_seconds: 900
+
+  - name: aws-ops
+    modes: [commands]
+    image: airlock-runner-aws:latest          # FROM the airlock image, plus the AWS CLI
+    credentials_dir: /opt/airlock/creds/aws-ops
+    network: airlock-aws
+    env:
+      AWS_SHARED_CREDENTIALS_FILE: /airlock/creds/credentials
+      AWS_CONFIG_FILE: /airlock/creds/config
+      AWS_REGION: ap-southeast-1
+    allowed_permissions: ["rds:reboot", "ses:sending"]
+    command_allowlist:
+      - "aws rds reboot-db-instance --db-instance-identifier [a-z0-9-]+"
+      - "aws rds describe-db-instances --db-instance-identifier [a-z0-9-]+"
+      - "aws sesv2 put-account-sending-attributes --(no-)?sending-enabled"
+    posture_checks:
+      - name: is the dedicated IAM user
+        argv: [aws, sts, get-caller-identity, --query, Arn, --output, text]
+        expect: "user/airlock-aws-ops$"
+
+  - name: repo
+    modes: [task]                             # an agent inside the container, behind the catastrophe floor
+    image: airlock-runner-claude:latest       # FROM the airlock image, plus git and the Claude Code CLI
+    credentials_dir: /opt/airlock/creds/repo  # a token that can push branches, not merge them
+    workspace_dir: /opt/airlock/workspaces/repo
+    network: airlock-egress                   # only the egress proxy's allowlist is reachable
+    env:
+      HTTPS_PROXY: http://egress:8888
+      HTTP_PROXY: http://egress:8888
+    allowed_permissions: ["git:push-branch"]
+    timeout_seconds: 1800
+
+# ---------------------------------------------------------------- the pipe's outlet
+#
+# Every notification is a signed webhook (X-Airlock-Timestamp, X-Airlock-Signature,
+# X-Airlock-Event), retried with backoff, then dead-lettered. Events: work.created,
+# plan.ready, plan.revised, plan.invalid, work.answered, work.approved, run.started,
+# run.finished, run.failed, run.refused, run.cancelled, approval.expired,
+# approval.revoked, work.rejected, work.closed, work.error, ledger.checkpoint.
+subscriptions:
+  - name: lark
+    url: http://lark-adapter:9000/airlock
+    secret_env: AIRLOCK_SUB_LARK_SECRET
+    events: [plan.ready, plan.revised, plan.invalid, work.answered, run.finished, run.failed, run.refused, work.error]
+  - name: ledger-witness                      # somewhere else keeps every ledger head, so a rewritten ledger shows
+    url: https://witness.example.internal/airlock
+    secret_env: AIRLOCK_SUB_WITNESS_SECRET
+    events: [ledger.checkpoint]
+
+# ---------------------------------------------------------------- adapters: speaking for you from elsewhere
+#
+# An adapter posts to /v1/adapters/<name>/message and /decision, signed with its
+# secret, naming the platform user. Only users listed in identities speak for you.
+adapters:
+  - name: lark
+    secret_env: AIRLOCK_ADAPTER_LARK_SECRET
+    identities: ["ou_replace_with_your_open_id"]

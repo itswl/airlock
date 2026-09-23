@@ -1,0 +1,54 @@
+[project]
+name = "airlock"
+version = "0.1.0"
+description = "Agents investigate read-only; an operation runs only after you approve that exact plan, in an isolated container, with every step recorded."
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "httpx>=0.27",
+  "pydantic>=2.6",
+  "pyyaml>=6",
+  "jinja2>=3.1",
+  "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+claude = ["claude-agent-sdk>=0.1"]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+airlock-control = "airlock.control.__main__:main"
+airlock-launcher = "airlock.launcher.app:main"
+airlock-investigator = "airlock.runner.investigator:main"
+airlock-passwd = "airlock.control.passwd:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["airlock*"]
+
+[tool.setuptools.package-data]
+airlock = ["control/templates/*.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+  "error::pytest.PytestUnraisableExceptionWarning",
+  # Starlette's TestClient announcing its own transport change; nothing here to act on.
+  "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM"]
+# The formatter owns line length; a long message string stays whole so it can be grepped.
+ignore = ["S101", "S603", "S607", "B008", "E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106", "S108"]

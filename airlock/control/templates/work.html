@@ -1,0 +1,175 @@
+{% extends "base.html" %}
+{% block title %}{{ work.title }} · airlock{% endblock %}
+{% block head %}{% if work.state in ("queued", "investigating", "approved", "running") %}<meta http-equiv="refresh" content="5">{% endif %}{% endblock %}
+{% block body %}
+<p class="small"><a href="/">← 工作项</a></p>
+<h1>{{ work.title }}</h1>
+<p>
+  <span class="badge s-{{ work.state }}">{{ STATE_LABELS.get(work.state, work.state) }}</span>
+  <span class="muted small">来源 {{ work.source }} · 调查员 {{ work.investigator }} · {{ work.created_at|when }} · #{{ work.id }}</span>
+  {% if work.url %}· <a class="small" href="{{ work.url }}" rel="noreferrer noopener" target="_blank">原始链接</a>{% endif %}
+</p>
+{% if work.note %}<p class="small muted">{{ work.note }}</p>{% endif %}
+
+{% if current %}
+{% set plan = current.plan %}
+<div class="card {% if work.state == 'plan_ready' %}decide{% endif %}">
+  <h2 style="margin-top:0">方案 v{{ current.version }} · <span class="risk-{{ plan.risk }}">风险 {{ plan.risk }}</span></h2>
+  <p><strong>{{ plan.summary }}</strong></p>
+  {% if changes %}
+  <details open><summary>相对 v{{ previous_version }} 改了什么</summary><pre>{{ changes }}</pre></details>
+  {% endif %}
+  <h3>会改什么</h3><pre>{{ plan.changes }}</pre>
+  <h3>步骤 <span class="small muted">每步由指定的工作画像在隔离容器里执行，逐条记录</span></h3>
+  <table>
+    <tr><th>#</th><th>工作画像</th><th>目标</th><th>命令 / 任务</th><th>为什么</th></tr>
+    {% for step in plan.steps %}
+    <tr>
+      <td>{{ loop.index }}</td><td>{{ step.worker }}</td><td>{{ step.target }}</td>
+      <td>{% if step.argv %}<code>{{ step.argv|argv }}</code>{% else %}<span class="badge">agent 任务</span> {{ step.task }}{% endif %}</td>
+      <td class="small">{{ step.why }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <h3>需要的权限</h3>
+  <table>
+    <tr><th>工作画像</th><th>本次用到</th><th>这个画像最多能有</th></tr>
+    {% for worker, needed in plan.permissions.items() %}
+    <tr><td>{{ worker }}</td><td>{{ needed|join(", ") or "—" }}</td>
+      <td class="small muted">{% if workers.get(worker) %}{{ workers[worker].allowed_permissions|join(", ") or "—" }}{% endif %}</td></tr>
+    {% endfor %}
+  </table>
+  <div class="row">
+    <div class="grow"><h3>回滚</h3><pre>{{ plan.rollback }}</pre></div>
+    <div class="grow"><h3>怎么验证</h3><pre>{{ plan.verification }}</pre></div>
+  </div>
+  {% if plan.evidence %}<details><summary>证据</summary><pre>{{ plan.evidence }}</pre></details>{% endif %}
+  <p class="small muted">plan hash <code>{{ current.plan_hash }}</code></p>
+
+  {% if "approve" in work.actions %}
+  <div class="row" style="margin-top:12px">
+    <form method="post" action="/work/{{ work.id }}/approve">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="version" value="{{ current.version }}">
+      <input type="hidden" name="plan_hash" value="{{ current.plan_hash }}">
+      <button class="primary">批准 v{{ current.version }} 并执行</button>
+    </form>
+    <form method="post" action="/work/{{ work.id }}/reject" class="row">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="text" name="reason" placeholder="驳回理由（可选）" style="width:220px">
+      <button class="danger">驳回</button>
+    </form>
+  </div>
+  <p class="small muted">批准只放行这一版、这个 hash；方案再变一个字就是新的一版，要重新批准。批准后只能启动一次。</p>
+  {% endif %}
+</div>
+{% endif %}
+
+{% if "revoke" in work.actions %}
+<div class="card">
+  已批准，等执行器启动。
+  <form method="post" action="/work/{{ work.id }}/revoke" style="display:inline">
+    <input type="hidden" name="csrf" value="{{ csrf }}"><button class="danger">撤回批准</button>
+  </form>
+</div>
+{% endif %}
+
+{% if steps %}
+<h2>执行记录</h2>
+<table>
+  <tr><th>时间</th><th>组</th><th>工作画像</th><th>事件</th><th>步</th><th>目标</th><th>内容</th><th>结果</th></tr>
+  {% for s in steps %}
+  <tr>
+    <td class="small muted">{{ s.at|when }}</td><td>{{ s.group_index }}</td><td>{{ s.worker }}</td><td>{{ s.event }}</td>
+    <td>{{ s.step_index if s.step_index is not none else "" }}</td><td>{{ s.target }}</td>
+    <td><code>{{ s.detail }}</code>{% if s.tail %}<details><summary>输出</summary><pre>{{ s.tail }}</pre></details>{% endif %}</td>
+    <td>{{ s.status }}{% if s.exit_code is not none %} · exit {{ s.exit_code }}{% endif %}{% if s.duration_ms is not none %} · {{ s.duration_ms }}ms{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% if "cancel" in work.actions %}
+<form method="post" action="/work/{{ work.id }}/cancel" style="margin-top:10px">
+  <input type="hidden" name="csrf" value="{{ csrf }}"><button class="danger">急停</button>
+  <span class="small muted">杀掉正在跑的容器，后面的步骤不再执行</span>
+</form>
+{% endif %}
+{% endif %}
+
+{% for run in runs %}
+<div class="card">
+  <h3 style="margin-top:0">执行结果：{{ STATE_LABELS.get(run.status, run.status) }} <span class="small muted">{{ run.received_at|when }}</span></h3>
+  {% if run.result.reason %}<p>{{ run.result.reason }}</p>{% endif %}
+  <table>
+    <tr><th>组</th><th>工作画像</th><th>状态</th><th>隔离</th><th>记录链</th></tr>
+    {% for g in run.result.groups or [] %}
+    <tr><td>{{ loop.index }}</td><td>{{ g.worker }}</td><td>{{ g.status }}</td><td>{{ g.isolation }}</td>
+      <td>{% if g.record_intact %}<span class="ok">完整</span>{% else %}<span class="bad">不完整</span>{% endif %} <code class="small">{{ (g.record_head or "")[:16] }}</code></td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endfor %}
+
+<h2>对话</h2>
+<div class="msg src"><div class="small muted">{{ work.source }} · {{ work.created_at|when }}</div><pre>{{ work.body or "（无正文）" }}</pre></div>
+{% for m in messages %}
+<div class="msg {% if m.author == operator %}op{% elif m.author.startswith('investigator:') %}inv{% elif m.author == 'system' %}sys{% else %}src{% endif %}">
+  <div class="small muted">{{ m.author }} · {{ m.via }} · {{ m.at|when }}</div>
+  <pre>{{ m.text }}</pre>
+</div>
+{% endfor %}
+{% for c in consults %}
+<div class="msg inv">
+  <div class="small muted">会诊 {{ c.from_profile }} → {{ c.to_profile }} · {{ c.status }} · {{ c.at|when }}{% if c.flags %} · 已脱敏 {{ c.flags|join(", ") }}{% endif %}</div>
+  <pre>问：{{ c.question }}</pre>
+  {% if c.answer %}<pre>答：{{ c.answer }}</pre>{% endif %}
+</div>
+{% endfor %}
+
+{% if "message" in work.actions %}
+<div class="card">
+  <form method="post" action="/work/{{ work.id }}/message">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <textarea name="text" placeholder="有异议或补充？写在这里，调查员会按你的话修订方案（新版本要重新批准）"></textarea>
+    <p><button>发给调查员</button></p>
+  </form>
+  {% if "close" in work.actions %}
+  <form method="post" action="/work/{{ work.id }}/close" class="row">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="text" name="reason" placeholder="关闭理由（可选）" style="width:260px"><button>关闭</button>
+  </form>
+  {% endif %}
+</div>
+{% endif %}
+
+<h2>审计</h2>
+<details><summary>账本（{{ ledger|length }} 条，哈希链）</summary>
+<table>
+  <tr><th>#</th><th>时间</th><th>事件</th><th>谁</th><th>内容</th><th>hash</th></tr>
+  {% for e in ledger %}
+  <tr><td>{{ e.seq }}</td><td class="small muted">{{ e.ts|when }}</td><td>{{ e.kind }}</td><td>{{ e.actor }}</td>
+    <td><pre class="small">{{ e.data|pretty }}</pre></td><td><code class="small">{{ e.hash[:12] }}</code></td></tr>
+  {% endfor %}
+</table>
+</details>
+{% if plans %}
+<details><summary>方案历史（{{ plans|length }} 版）</summary>
+{% for p in plans %}
+<div class="card">
+  <strong>v{{ p.version }}</strong> <span class="small muted">{{ p.author }} · {{ p.created_at|when }} · <code>{{ p.plan_hash[:16] }}</code></span>
+  {% if p.errors %}<p class="bad small">不可批准：{{ p.errors|join("；") }}</p>{% endif %}
+  <pre class="small">{{ p.plan|pretty }}</pre>
+</div>
+{% endfor %}
+</details>
+{% endif %}
+{% if approvals %}
+<details><summary>批准记录</summary>
+<table>
+  <tr><th>批准</th><th>版本</th><th>方式</th><th>时间</th><th>有效至</th><th>状态</th><th>备注</th></tr>
+  {% for a in approvals %}
+  <tr><td><code>{{ a.id }}</code></td><td>v{{ a.version }}</td><td>{{ a.via }}</td><td class="small">{{ a.at|when }}</td><td class="small">{{ a.expires_at|when }}</td><td>{{ a.status }}</td><td class="small">{{ a.note }}</td></tr>
+  {% endfor %}
+</table>
+</details>
+{% endif %}
+{% endblock %}
