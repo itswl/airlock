@@ -145,6 +145,9 @@ def main(argv: list[str] | None = None) -> int:
         result = run_round(config, scanner, record, force=args.force, dry_run=args.dry_run)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["outcome"] != "error" else 1
+    # Said at once, not at the first tick: a self-check reading status.json between a start
+    # and the first tick would otherwise find nothing and take the watcher for dead.
+    status(config, tick_at=time.time(), outcome="started")
     logger.info(
         "watch up: every %sm, window %s, days %s, tz %s",
         config.schedule.every_minutes,

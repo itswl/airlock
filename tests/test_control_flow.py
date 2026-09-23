@@ -482,3 +482,16 @@ async def test_fresh_is_offered_only_where_it_makes_sense(h: Harness) -> None:
     work_id, _, _ = await h.running()
     assert h.plane.fresh(work_id, via="web").status == 409
     assert h.plane.fresh("nope", via="web").status == 404
+
+
+def test_a_notification_carries_the_report_s_first_paragraph_masked() -> None:
+    from airlock.control.service import lead_of
+
+    report = (
+        "## Findings\n\nTwo config lines and a restart. Token AKIAABCDEFGHIJKLMNOP was in the log.\n\nDetails below."
+    )
+    lead = lead_of(report)
+    assert lead.startswith("Two config lines and a restart.")  # the heading alone is skipped
+    assert "AKIAABCDEFGHIJKLMNOP" not in lead
+    assert "AKIAABCDEFGHIJKLMNOP" not in lead_of("Two config lines. Token AKIAABCDEFGHIJKLMNOP was in the log.")
+    assert lead_of("") == ""

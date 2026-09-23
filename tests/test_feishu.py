@@ -92,6 +92,7 @@ PLAN = {
     "version": 1,
     "plan_hash": "h",
     "summary": "Restart <at id=all></at> the api",
+    "lead": "Two lines of config and a restart, [about] 20 minutes.",
     "risk": "low",
     "changed": False,
 }
@@ -122,7 +123,8 @@ def test_a_work_item_s_cards_go_into_one_thread_and_a_redelivery_is_sent_once(tm
     assert fake.sent[1]["reply_in_thread"] is True
     first = json.loads(fake.sent[0]["content"])
     markdown = [e["text"]["content"] for e in first["elements"] if e.get("tag") == "div"]
-    assert markdown[0] == "**Restart \\<at id=all>\\</at> the api**"  # neutralised: no one is paged
+    assert markdown[0] == "Two lines of config and a restart, \\[about\\] 20 minutes."  # the report's lead
+    assert markdown[1] == "**方案**：Restart \\<at id=all>\\</at> the api"  # neutralised: no one is paged
     buttons = [a for e in first["elements"] if e.get("tag") == "action" for a in e["actions"]]
     assert [(b["text"]["content"], b["url"]) for b in buttons] == [("看方案并批准", "http://console.invalid/work/w1")]
     done = json.dumps(json.loads(fake.sent[1]["content"]), ensure_ascii=False)

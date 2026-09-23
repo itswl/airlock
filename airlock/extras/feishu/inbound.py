@@ -143,4 +143,7 @@ def listen(config: FeishuConfig, cards: Cards) -> None:
 
     handler = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(on_message).build()
     domain = lark.LARK_DOMAIN if config.brand == "lark" else lark.FEISHU_DOMAIN
-    lark.ws.Client(config.app_id, config.app_secret, event_handler=handler, domain=domain).start()
+    # WARNING, not INFO: at INFO the SDK logs the connection URL, access key included.
+    lark.ws.Client(
+        config.app_id, config.app_secret, event_handler=handler, domain=domain, log_level=lark.LogLevel.WARNING
+    ).start()

@@ -25,6 +25,7 @@ from __future__ import annotations
 import difflib
 import json
 import logging
+import re
 import secrets
 import time
 import uuid
@@ -59,6 +60,20 @@ class Outcome:
     @property
     def ok(self) -> bool:
         return 200 <= self.status < 300
+
+
+def lead_of(prose: str, limit: int = 500) -> str:
+    """The report's first paragraph, for a notification: a card quotes it, and often that is all that is read.
+
+    Credential shapes are masked here too, because a subscriber carries it into a chat.
+    """
+    for paragraph in re.split(r"\n\s*\n", prose or ""):
+        text = paragraph.strip()
+        if not text or (text.startswith("#") and "\n" not in text):
+            continue  # a heading alone says what follows, not what was found
+        clean, _ = redact(re.sub(r"^#+\s*", "", text))
+        return clean[:limit]
+    return ""
 
 
 def _workspace_summary(workspace: Mapping[str, Any]) -> dict[str, Any]:
@@ -469,15 +484,16 @@ class ControlPlane:
         prose = strip_plans(text)
         if prose:
             self._message(work["id"], f"investigator:{profile}", prose, via="investigation")
+        lead = lead_of(prose)
         if not has_plan(text):
-            return self._answered(work, profile, usage)
+            return self._answered(work, profile, usage, lead=lead)
         try:
             plan = extract_plan(text)
             errors = validate_plan(plan, self.config.workers)
         except PlanError as exc:
             plan, errors = None, [str(exc)]
         if plan is not None and not errors:
-            return self._plan_ready(work, profile, plan, usage)
+            return self._plan_ready(work, profile, plan, usage, lead=lead)
         version = None
         if plan is not None:
             version = self._store_plan(work["id"], profile, plan, errors)
@@ -523,7 +539,7 @@ class ControlPlane:
         )
         return version
 
-    def _answered(self, work: Mapping[str, Any], profile: str, usage: Mapping[str, Any]) -> Outcome:
+    def _answered(self, work: Mapping[str, Any], profile: str, usage: Mapping[str, Any], *, lead: str = "") -> Outcome:
         """No plan in the reply. With a plan already standing, it was an answer about that plan."""
         target = "plan_ready" if work["current_version"] else "answered"
         state = self._settle(work, target)
@@ -534,10 +550,12 @@ class ControlPlane:
             data={"plan_version": work["current_version"], **usage},
         )
         if state != "queued":
-            self._notify("work.answered", work["id"], plan_version=work["current_version"])
+            self._notify("work.answered", work["id"], plan_version=work["current_version"], lead=lead)
         return Outcome(200, {"status": state})
 
-    def _plan_ready(self, work: Mapping[str, Any], profile: str, plan: Any, usage: Mapping[str, Any]) -> Outcome:
+    def _plan_ready(
+        self, work: Mapping[str, Any], profile: str, plan: Any, usage: Mapping[str, Any], *, lead: str = ""
+    ) -> Outcome:
         digest = plan_hash(plan)
         current = self.plan_row(work["id"], work["current_version"]) if work["current_version"] else None
         if current is not None and current["plan_hash"] == digest:
@@ -568,6 +586,7 @@ class ControlPlane:
                 summary=plan.summary,
                 risk=plan.risk,
                 changed=changed,
+                lead=lead,
             )
         return Outcome(200, {"status": state, "version": version})
 

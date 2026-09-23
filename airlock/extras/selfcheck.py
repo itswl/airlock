@@ -40,6 +40,7 @@ from airlock.extras.watch.scan import in_window, write_atomically
 
 logger = logging.getLogger("airlock.selfcheck")
 FAILS_BEFORE_ALARM = 2
+START_AFTER_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -219,6 +220,10 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["TZ"] = config.tz
         time.tzset()
     selfcheck = Selfcheck(config)
+    if not args.once:
+        # Started with everything else: give the rest a minute to listen before the first check,
+        # or every start begins with a round of refused connections.
+        time.sleep(START_AFTER_SECONDS)
     while True:
         for result in selfcheck.tick():
             logger.info("%s: %s — %s", result["name"], "ok" if result["ok"] else "FAILING", result["detail"])

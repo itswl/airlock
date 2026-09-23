@@ -71,7 +71,8 @@ def for_event(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         risk = str(payload.get("risk") or "")
         head = "方案已修订" if event == "plan.revised" else "方案待批准"
         blocks = [
-            f"**{escape(payload.get('summary'))}**",
+            escape(payload.get("lead")),
+            f"**方案**：{escape(payload.get('summary'))}",
             f"**风险**：{escape(risk or '未标注')}　**版本**：v{escape(version)}",
             "相对上一版有改动，批准前看一下差异。" if payload.get("changed") else "",
         ]
@@ -87,7 +88,7 @@ def for_event(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         return card(
             f"调查完成：{title}",
             "blue",
-            [escape(payload.get("summary") or "调查员给出了结论，没有需要执行的方案。")],
+            [escape(payload.get("lead") or payload.get("summary") or "调查员给出了结论，没有需要执行的方案。")],
             link=link,
             link_text="看报告",
             note=f"{work} · {REPLY_HINT}",

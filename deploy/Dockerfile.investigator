@@ -1,11 +1,21 @@
-# An investigator: the airlock image plus the Claude Agent SDK, which bundles
-# the Claude Code CLI. Add the read-only tools this profile investigates with
-# (kubectl, the AWS CLI, ...) on top, and nothing that writes.
 ARG BASE=airlock:0.1
 FROM ${BASE}
 USER 0
 # git too: the same image runs task-mode workers, which commit in their workspace.
 RUN pip install --no-cache-dir 'claude-agent-sdk>=0.2.158' \
  && apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+# What a profile reads with, chosen per deployment rather than written here:
+#   docker build --build-arg APT_EXTRAS="curl jq awscli" --build-arg KUBECTL_VERSION=v1.31.4 ...
+# A profile's shell guard decides what it may run; these only decide what exists.
+ARG APT_EXTRAS=""
+RUN if [ -n "$APT_EXTRAS" ]; then \
+      apt-get update && apt-get install -y --no-install-recommends $APT_EXTRAS && rm -rf /var/lib/apt/lists/*; \
+    fi
+ARG KUBECTL_VERSION=""
+RUN if [ -n "$KUBECTL_VERSION" ]; then \
+      python -c "import urllib.request, platform; arch = {'aarch64': 'arm64', 'x86_64': 'amd64'}[platform.machine()]; \
+urllib.request.urlretrieve(f'https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/{arch}/kubectl', '/usr/local/bin/kubectl')" \
+      && chmod +x /usr/local/bin/kubectl; \
+    fi
 USER 10001
 CMD ["python", "-m", "airlock.runner.investigator", "--port", "8100"]
