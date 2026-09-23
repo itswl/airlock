@@ -92,6 +92,18 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 
 `scripts/demo.py --smoke` 用随机端口把上面整个流程自动走一遍然后退出。
 
+### 换成真模型
+
+```bash
+pip install -e '.[claude]'          # Claude Agent SDK，自带 Claude Code CLI
+export ANTHROPIC_BASE_URL=…  ANTHROPIC_AUTH_TOKEN=…  AIRLOCK_MODEL=…   # 任何 Anthropic 兼容网关
+.venv/bin/python scripts/demo.py --engine claude
+```
+
+两个调查员换成真的 Claude 引擎，读的是一套编造的故障证据（日志、指标、runbook；部署历史只在 code 那边，infra 要去会诊）。它们在本机跑，所以是**受限模式**（`AIRLOCK_CONFINE=1`，见 `airlock/runner/sandbox.py`）：工作目录是仓库外新建的临时目录，工具只能碰这个目录，shell 只剩几条只读命令，其他一律拒绝并记录。别在限制模式之外、容器之外用真模型：它读到的东西都会作为工具输出发给模型网关。
+
+CLI 报的 `cost_usd` 是它按自己的价目表估的，续接的会话里还会累加；每一轮的真实用量看账本里的 `usage`（token 数）。
+
 ## 部署
 
 - `config.example.yaml`：带注释的完整配置（来源、路由、调查画像、工作画像、订阅、适配器）。密钥只写环境变量名。
@@ -114,10 +126,12 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 
 已实现并有测试（`pytest` 覆盖各模块和一个全链路 e2e；`scripts/demo.py --smoke` 另用真实的多个 HTTP 服务走一遍）：管道进口与出口、路由、调查节点、会诊中转、计划校验与版本、网页控制台、审批绑定、启动器复核、本地运行时、执行器、姿态自检、账本与执行记录的哈希链、出网代理。
 
+真模型跑过的（2026-09-23，经 LiteLLM 用 `gpt-5.6-luna`，Claude Agent SDK 0.2.158 / CLI 2.1.280，受限模式在本机）：`scripts/demo.py --smoke --engine claude` 全流程走通——调查员读证据、经控制面会诊另一个调查员、给出能过校验的计划、按留言修订出新版本、批准后执行；另外单独验证了钩子的拒绝真的挡住 CLI（工作目录外的诱饵文件、`kubectl delete` 都被拒，内容没有到模型那里）。
+
 写了但**没有真跑过**的：
 
 - Docker 运行时：`docker run` 的参数有测试，但没有在 Docker 上跑过一个真容器。
-- Claude 引擎：接线（钩子过守卫、会诊工具、会话续接）用替身 SDK 测过，没有调用过真模型。
+- 容器里的调查员和 task 模式的工作画像（真模型只在本机受限模式下跑过）。
 - `deploy/` 下的镜像和编排。
 
 还**没有做**的：

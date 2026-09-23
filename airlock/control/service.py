@@ -398,7 +398,7 @@ class ControlPlane:
             return refused
         assert work is not None
         text = str(payload.get("text") or "")
-        usage = {k: payload[k] for k in ("cost_usd", "turns", "refusals") if k in payload}
+        usage = {k: payload[k] for k in ("cost_usd", "turns", "refusals", "usage") if k in payload}
         prose = strip_plans(text)
         if prose:
             self._message(work["id"], f"investigator:{profile}", prose, via="investigation")
@@ -561,7 +561,9 @@ class ControlPlane:
             )
             if response.status_code != 200:
                 raise httpx.HTTPStatusError(f"HTTP {response.status_code}", request=response.request, response=response)
-            answer = str(response.json().get("answer") or "")
+            reply = response.json()
+            answer = str(reply.get("answer") or "")
+            spent = {k: reply[k] for k in ("cost_usd", "turns", "usage") if k in reply}
         except (httpx.HTTPError, ValueError) as exc:
             self.db.execute(
                 "UPDATE consults SET status = 'failed', answered_at = ? WHERE id = ?", [self.clock(), consult_id]
@@ -579,7 +581,7 @@ class ControlPlane:
             "consult.answered",
             work_id=work["id"],
             actor=f"investigator:{to}",
-            data={"consult": consult_id, "flags": flags},
+            data={"consult": consult_id, "flags": flags, **spent},
         )
         return Outcome(200, {"answer": clean, "flags": flags})
 

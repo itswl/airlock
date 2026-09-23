@@ -27,6 +27,9 @@ Configuration is the environment, because a node is a container:
     AIRLOCK_MCP_ALLOWED        comma-separated MCP tools this profile may call
     AIRLOCK_MAX_CONCURRENT     investigations at once (default 2)
     AIRLOCK_MODEL              model name for the claude engine
+    AIRLOCK_MAX_BUDGET_USD     per-turn spending cap the claude engine enforces
+    AIRLOCK_CONFINE            1 when the node runs on a host rather than in its own container:
+                               tools only inside the working directory, read-only shell (airlock.runner.sandbox)
 """
 
 from __future__ import annotations
@@ -97,6 +100,8 @@ class NodeConfig:
     max_turns: int = 40
     timeout_seconds: float = 1800.0
     model: str | None = None
+    max_budget_usd: float | None = None
+    confine: bool = False
 
 
 def load_node(env: Mapping[str, str] | None = None) -> NodeConfig:
@@ -123,6 +128,8 @@ def load_node(env: Mapping[str, str] | None = None) -> NodeConfig:
         max_turns=int(env.get("AIRLOCK_MAX_TURNS", "40")),
         timeout_seconds=float(env.get("AIRLOCK_TIMEOUT_SECONDS", "1800")),
         model=env.get("AIRLOCK_MODEL") or None,
+        max_budget_usd=float(env["AIRLOCK_MAX_BUDGET_USD"]) if env.get("AIRLOCK_MAX_BUDGET_USD") else None,
+        confine=env.get("AIRLOCK_CONFINE", "").lower() in ("1", "true", "yes"),
     )
 
 
@@ -300,7 +307,9 @@ class InvestigatorNode:
 
     def _policy(self, record_name: str, mcp_allowed: frozenset[str]) -> ToolPolicy:
         recorder = Recorder(self.state / "records" / f"{record_name}.jsonl")
-        return ToolPolicy(READONLY, self.config.workdir, mcp_allowed=mcp_allowed, record=recorder.write)
+        return ToolPolicy(
+            READONLY, self.config.workdir, mcp_allowed=mcp_allowed, record=recorder.write, confine=self.config.confine
+        )
 
     async def _investigate(self, payload: dict[str, Any]) -> None:
         work_id = str(payload["work_id"])
@@ -336,6 +345,7 @@ class InvestigatorNode:
                             "cost_usd": result.cost_usd,
                             "turns": result.turns,
                             "refusals": result.refusals,
+                            "usage": dict(result.usage or {}),
                         },
                     )
             except Exception as exc:  # noqa: BLE001 — the control plane must hear about every ending
@@ -364,7 +374,12 @@ class InvestigatorNode:
         )
         async with self.semaphore:
             result = await self.engine.run(request, self._policy(f"consult-{work_id}", request.mcp_allowed))
-        return 200, {"answer": result.text or (result.error or "no answer")}
+        return 200, {
+            "answer": result.text or (result.error or "no answer"),
+            "cost_usd": result.cost_usd,
+            "turns": result.turns,
+            "usage": dict(result.usage or {}),
+        }
 
     async def drain(self) -> None:
         while self.running:
@@ -418,9 +433,14 @@ def create_node_app(node: InvestigatorNode) -> FastAPI:
 def build_engine(config: NodeConfig) -> Engine:
     if config.engine == "stub":
         return StubEngine(lambda request: StubTurn(text="stub engine: no investigation was run"))
-    from airlock.runner.claude_engine import ClaudeEngine
+    from airlock.runner.claude_engine import BUILTIN_TOOLS, ClaudeEngine
+    from airlock.runner.sandbox import CONFINED_TOOLS
 
-    return ClaudeEngine(model=config.model)
+    return ClaudeEngine(
+        model=config.model,
+        tools=CONFINED_TOOLS if config.confine else BUILTIN_TOOLS,
+        max_budget_usd=config.max_budget_usd,
+    )
 
 
 def main() -> None:

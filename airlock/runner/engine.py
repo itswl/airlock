@@ -20,8 +20,9 @@ from typing import Any, Protocol
 
 from airlock.crypto import sha256_hex
 from airlock.runner.gate import deny_reason, redact
+from airlock.runner.sandbox import CONSULT_TOOL, confine_reason
 
-CONSULT_TOOL = "mcp__airlock__consult"
+__all__ = ["CONSULT_TOOL", "Engine", "EngineRequest", "EngineResult", "StubEngine", "StubTurn", "ToolPolicy"]
 Consult = Callable[[str, str], Awaitable[str]]
 Record = Callable[..., Any]
 
@@ -47,14 +48,22 @@ class EngineRequest:
 class EngineResult:
     text: str
     session: str | None = None
+    # As the engine reports it. For the Claude CLI this is its own price table,
+    # not the gateway's, and it accumulates across a resumed session: read the
+    # token counts in ``usage`` for what a turn actually used.
     cost_usd: float | None = None
     turns: int = 0
     refusals: int = 0
     error: str | None = None
+    usage: Mapping[str, int] | None = None
 
 
 class ToolPolicy:
-    """The decision before a tool runs and the record after it, for one turn."""
+    """The decision before a tool runs and the record after it, for one turn.
+
+    ``confine`` is for an agent on a host rather than in its own container: see
+    airlock.runner.sandbox. It is checked first, then the posture's own guard.
+    """
 
     def __init__(
         self,
@@ -63,11 +72,15 @@ class ToolPolicy:
         *,
         mcp_allowed: frozenset[str] = frozenset(),
         record: Record | None = None,
+        confine: bool = False,
     ) -> None:
+        if confine and workdir is None:
+            raise ValueError("a confined policy needs the working directory it confines to")
         self.mode = mode
         self.workdir = workdir
         self.mcp_allowed = mcp_allowed
         self.record = record
+        self.confine = confine
         self.refusals = 0
         self.calls = 0
 
@@ -76,7 +89,14 @@ class ToolPolicy:
             self.record(kind, **data)
 
     def before(self, tool: str, tool_input: Mapping[str, Any]) -> str | None:
-        decision = deny_reason(tool, tool_input, mode=self.mode, workdir=self.workdir, mcp_allowed=self.mcp_allowed)
+        data = dict(tool_input)
+        decision: tuple[str, str] | None = None
+        if self.confine and self.workdir is not None:
+            reason = confine_reason(tool, data, self.workdir)
+            if reason is not None:
+                decision = ("sandbox", f"sandbox: {reason}")
+        if decision is None:
+            decision = deny_reason(tool, data, mode=self.mode, workdir=self.workdir, mcp_allowed=self.mcp_allowed)
         detail, _ = redact(tool_detail(tool_input))
         if decision is not None:
             guard, reason = decision

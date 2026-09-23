@@ -14,9 +14,12 @@ the control plane says this profile may consult somebody.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import json
 import logging
+import os
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from airlock.runner.engine import CONSULT_TOOL, EngineRequest, EngineResult, ToolPolicy
@@ -26,6 +29,25 @@ logger = logging.getLogger("airlock.claude")
 
 BUILTIN_TOOLS = ("Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite")
 INTERRUPT_GRACE_SECONDS = 30.0
+
+# What the CLI subprocess gets on top of the environment it inherits. The SDK
+# passes this process's whole environment through, so a variable is REMOVED by
+# setting it to "" here.
+CLI_DEFAULTS = {
+    # Model calls go to the configured gateway; nothing else leaves (no
+    # telemetry, error reports or update checks).
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    # One hung command must not hold the whole turn.
+    "BASH_DEFAULT_TIMEOUT_MS": "120000",
+    "BASH_MAX_TIMEOUT_MS": "600000",
+}
+_SECRET_MARKERS = ("SECRET", "TOKEN", "PASSWORD", "PASSWD", "KEY")
+
+
+def withheld(environ: Mapping[str, str]) -> dict[str, str]:
+    """airlock's own secrets, blanked for the agent: with the node's signing secret a
+    shell step could post as this profile, and anything it can read it can send."""
+    return {name: "" for name in environ if name.startswith("AIRLOCK_") and any(m in name for m in _SECRET_MARKERS)}
 
 
 def _response_text(response: Any) -> tuple[str, bool]:
@@ -42,9 +64,23 @@ def _response_text(response: Any) -> tuple[str, bool]:
 
 
 class ClaudeEngine:
-    def __init__(self, *, model: str | None = None, extra_tools: tuple[str, ...] = ()) -> None:
+    """``tools`` is the built-in toolset the model is shown at all; the policy still decides each call."""
+
+    def __init__(
+        self,
+        *,
+        model: str | None = None,
+        tools: Sequence[str] = BUILTIN_TOOLS,
+        env: Mapping[str, str] | None = None,
+        max_budget_usd: float | None = None,
+    ) -> None:
         self.model = model
-        self.extra_tools = extra_tools
+        self.tools = tuple(tools)
+        self.env = dict(env or {})
+        self.max_budget_usd = max_budget_usd
+
+    def cli_env(self) -> dict[str, str]:
+        return {**CLI_DEFAULTS, **withheld(os.environ), **self.env}
 
     async def run(self, request: EngineRequest, policy: ToolPolicy) -> EngineResult:
         from claude_agent_sdk import (
@@ -73,7 +109,7 @@ class ClaudeEngine:
             return {}
 
         mcp_servers: dict[str, Any] = {}
-        allowed = [*BUILTIN_TOOLS, *self.extra_tools, *sorted(request.mcp_allowed)]
+        allowed = [*self.tools, *sorted(request.mcp_allowed)]
         if request.consult is not None and request.consultable:
             ask = request.consult
 
@@ -90,11 +126,16 @@ class ClaudeEngine:
             mcp_servers["airlock"] = create_sdk_mcp_server(name="airlock", version="1.0.0", tools=[consult_tool])
             allowed.append(CONSULT_TOOL)
 
+        stderr_tail: collections.deque[str] = collections.deque(maxlen=20)
         options = ClaudeAgentOptions(
             cwd=str(request.workdir),
             model=self.model,
             permission_mode="bypassPermissions",
+            tools=list(self.tools),
             allowed_tools=allowed,
+            env=self.cli_env(),
+            max_budget_usd=self.max_budget_usd,
+            stderr=stderr_tail.append,
             max_turns=request.max_turns,
             system_prompt={"type": "preset", "preset": "claude_code", "append": request.system},
             # Nothing from the user's or the project's settings: what steers a run
@@ -123,6 +164,11 @@ class ClaudeEngine:
                     result = message
 
         error: str | None = None
+
+        def with_stderr(message: str) -> str:
+            tail = " | ".join(line.strip() for line in stderr_tail if line.strip())[-600:]
+            return f"{message}; cli stderr: {tail}" if tail else message
+
         try:
             await client.connect()
             await client.query(request.prompt)
@@ -135,22 +181,37 @@ class ClaudeEngine:
                 with contextlib.suppress(Exception):
                     await client.interrupt()
                     await asyncio.wait_for(consume(), timeout=INTERRUPT_GRACE_SECONDS)
+        except Exception as exc:  # noqa: BLE001 — the CLI failing is an engine error with its own words attached
+            error = with_stderr(f"{type(exc).__name__}: {exc}"[:400])
         finally:
             with contextlib.suppress(Exception):
                 await client.disconnect()
 
         if result is None:
             return EngineResult(
-                text=last_text, turns=turns, refusals=policy.refusals, error=error or "the engine produced no result"
+                text=last_text,
+                turns=turns,
+                refusals=policy.refusals,
+                error=error or with_stderr("the engine produced no result"),
             )
         text = str(getattr(result, "result", None) or last_text or "").strip()
         if getattr(result, "is_error", False) and error is None:
-            error = str(getattr(result, "subtype", "") or "the engine reported an error")
+            reason = getattr(result, "subtype", "") or "the engine reported an error"
+            status = getattr(result, "api_error_status", None)
+            error = f"{reason} (HTTP {status})" if status else str(reason)
         return EngineResult(
             text=text,
             session=getattr(result, "session_id", None),
             cost_usd=getattr(result, "total_cost_usd", None),
-            turns=turns,
+            turns=int(getattr(result, "num_turns", None) or turns),
             refusals=policy.refusals,
             error=error,
+            usage=token_counts(getattr(result, "usage", None)),
         )
+
+
+def token_counts(usage: Any) -> dict[str, int] | None:
+    """The integer counters of a usage block — tokens in, out, cached — and nothing else."""
+    if not isinstance(usage, Mapping):
+        return None
+    return {k: int(v) for k, v in usage.items() if isinstance(v, int | float) and not isinstance(v, bool)} or None

@@ -164,3 +164,17 @@ async def test_no_consult_server_without_somebody_to_consult(tmp_path: Path, mon
     result = await ClaudeEngine().run(request, ToolPolicy(READONLY, tmp_path))
     assert seen["options"].mcp_servers == {} and CONSULT_TOOL not in seen["options"].allowed_tools
     assert result.text == "ok"
+
+
+def test_token_counts_keep_only_the_counters() -> None:
+    from airlock.runner.claude_engine import token_counts
+
+    usage = {
+        "input_tokens": 12,
+        "output_tokens": 3,
+        "service_tier": "standard",
+        "cache_read_input_tokens": 7.0,
+        "x": True,
+    }
+    assert token_counts(usage) == {"input_tokens": 12, "output_tokens": 3, "cache_read_input_tokens": 7}
+    assert token_counts(None) is None and token_counts({"service_tier": "standard"}) is None

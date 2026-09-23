@@ -12,6 +12,12 @@ Nothing is read from or written to anywhere else, and no credential is used.
 
     python scripts/demo.py            ports 18080 (console), 18090, 18101, 18102
     python scripts/demo.py --smoke    ephemeral ports; drives the whole flow itself and exits
+
+With --engine claude the two investigators run the real Claude engine instead
+of the stub, against whatever gateway ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN
+name (model: AIRLOCK_MODEL). They run confined (airlock.runner.sandbox): their
+working directories are fresh temp directories outside this checkout, seeded
+with a made-up incident, and their tools cannot reach anything else.
 """
 
 from __future__ import annotations
@@ -20,10 +26,12 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import re
 import secrets
 import socket
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -39,7 +47,7 @@ from airlock.crypto import sign
 from airlock.launcher.app import create_launcher_app
 from airlock.launcher.runtime import LocalRuntime
 from airlock.launcher.service import Launcher
-from airlock.runner.engine import EngineRequest, StubEngine, StubTurn
+from airlock.runner.engine import Engine, EngineRequest, StubEngine, StubTurn
 from airlock.runner.investigator import InvestigatorNode, NodeConfig, create_node_app
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -96,6 +104,58 @@ def code(request: EngineRequest) -> StubTurn:
     return StubTurn(text="有：09:10 那次发版把连接池从 20 改成了 10。")
 
 
+EVIDENCE = {
+    "infra": {
+        "README.md": (
+            "Demo environment. demo/api runs 3 pods behind the ops worker. There is no real cluster:\n"
+            "everything you can look at is in this directory.\n"
+        ),
+        "logs/api.log": "".join(
+            f"2026-09-23T09:{m:02d}:{s:02d}Z api-{p} ERROR pool exhausted: 10/10 connections in use, waited 5000ms\n"
+            f"2026-09-23T09:{m:02d}:{s:02d}Z api-{p} WARN request failed status=503 path=/v1/checkout\n"
+            for m, s, p in [(12, 3, 1), (12, 9, 2), (14, 40, 3), (19, 2, 1), (27, 55, 2), (33, 18, 3), (39, 47, 1)]
+        )
+        + "2026-09-23T09:05:11Z api-1 INFO pool ok: 6/20 connections in use\n",
+        "metrics/summary.txt": (
+            "window         5xx_rate  p99_ms  db_cpu  db_connections\n"
+            "09:00-09:10    0.2%      180     21%     34/200\n"
+            "09:12-09:40    7.1%      4200    22%     30/200\n"
+        ),
+        "runbook.md": (
+            "# demo/api runbook\n\n"
+            "Restart: in production `kubectl -n demo rollout restart deployment/api`.\n"
+            "In this demo the ops worker simulates every action with echo, one line per action:\n"
+            "  echo rollout restart deployment/api\n"
+            "  echo drain deployment/api\n"
+            "  echo set max_connections=20 deployment/api\n"
+        ),
+    },
+    "code": {
+        "deploys.log": (
+            "2026-09-22T16:40Z api v2.13.2 deployed by ci (no config change)\n"
+            "2026-09-23T09:10Z api v2.14.0 deployed by ci: config/pool.yaml max_connections 20 -> 10 "
+            "(commit 3f2a9c1 'tune pool for smaller db')\n"
+        ),
+        "config/pool.yaml": "max_connections: 10   # 20 before v2.14.0\nacquire_timeout_ms: 5000\n",
+    },
+}
+INSTRUCTIONS = {
+    "infra": (
+        "Demo. You look at demo/api through the files in your working directory: logs, metrics and a runbook. "
+        "You do NOT have the deploy history or the configuration; the code investigator does. Ask it with the "
+        "consult tool when a change in code or configuration could explain what you see."
+    ),
+    "code": "Demo. You hold demo/api's deploy history and configuration in your working directory. Answer from them.",
+}
+
+
+def seed(workdir: Path, files: dict[str, str]) -> None:
+    for name, content in files.items():
+        path = workdir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+
 def bind(port: int) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -145,7 +205,7 @@ def build(ports: dict[str, int], data: Path) -> tuple[dict[str, Any], dict[str, 
                 "name": "ops",
                 "modes": ["commands"],
                 "allowed_permissions": ["svc:restart"],
-                "command_allowlist": [r"echo [a-z0-9 .:-]+", "true", r"sleep [0-9]"],
+                "command_allowlist": [r"echo [a-z0-9 ./:=_-]+", "true", r"sleep [0-9]"],
             }
         ],
     }
@@ -168,10 +228,11 @@ async def send_alert(control_url: str, secret: str) -> str:
     return str(response.json()["work_id"])
 
 
-async def smoke(control_url: str, plane: ControlPlane, work_id: str) -> None:
+async def smoke(control_url: str, plane: ControlPlane, work_id: str, *, real: bool = False) -> None:
     """Do what a person would: wait for the plan, ask for a revision, approve it, wait for the record."""
+    patience = 900.0 if real else 30.0
 
-    async def state_is(*states: str, within: float = 30) -> str:
+    async def state_is(*states: str, within: float = patience) -> str:
         deadline = time.monotonic() + within
         while time.monotonic() < deadline:
             state = str((plane.work(work_id) or {}).get("state"))
@@ -180,30 +241,76 @@ async def smoke(control_url: str, plane: ControlPlane, work_id: str) -> None:
             await asyncio.sleep(0.2)
         raise SystemExit(f"smoke: {work_id} stuck in {(plane.work(work_id) or {}).get('state')}")
 
+    started = time.monotonic()
     async with httpx.AsyncClient(base_url=control_url, follow_redirects=False) as web:
-        await state_is("plan_ready")
+        first = await state_is("plan_ready", "answered", "plan_invalid", "error")
+        print(f"smoke: first round ended {first} after {time.monotonic() - started:.0f}s")
+        if first != "plan_ready":
+            report(plane, work_id)
+            raise SystemExit(1)
         assert (await web.post("/login", data={"password": PASSWORD})).status_code == 303
         page = (await web.get(f"/work/{work_id}")).text
         csrf = re.search(r'name="csrf" value="([0-9a-f]+)"', page).group(1)  # type: ignore[union-attr]
         await web.post(f"/work/{work_id}/message", data={"text": "先 drain 再重启", "csrf": csrf})
-        await state_is("queued", "investigating", within=5)
-        await state_is("plan_ready")
+        await state_is("queued", "investigating", within=10)
+        second = await state_is("plan_ready", "answered", "plan_invalid", "error")
+        print(f"smoke: revision round ended {second} after {time.monotonic() - started:.0f}s")
+        if second != "plan_ready":
+            report(plane, work_id)
+            raise SystemExit(1)
         page = (await web.get(f"/work/{work_id}")).text
         version = re.search(r'name="version" value="([0-9]+)"', page).group(1)  # type: ignore[union-attr]
         digest = re.search(r'name="plan_hash" value="([0-9a-f]+)"', page).group(1)  # type: ignore[union-attr]
         await web.post(f"/work/{work_id}/approve", data={"version": version, "plan_hash": digest, "csrf": csrf})
-        final = await state_is("done", "failed", "refused")
+        final = await state_is("done", "failed", "refused", within=120)
     detail = plane.detail(work_id) or {}
     steps = [s["detail"] for s in detail.get("steps", []) if s["event"] == "step.end"]
     print(f"smoke: {final}, plan v{version}, steps {steps}, ledger intact: {plane.ledger.verify()['intact']}")
-    if final != "done" or len(steps) != 3:
+    if real:
+        report(plane, work_id)
+    if final != "done" or (not real and len(steps) != 3):
         raise SystemExit(1)
+
+
+def report(plane: ControlPlane, work_id: str) -> None:
+    """What the investigators said and did, for reading after a real run."""
+    detail = plane.detail(work_id) or {}
+    for message in detail.get("messages", []):
+        print(f"\n--- {message['author']} ({message['via']})\n{message['text'][:1500]}")
+    for consult in detail.get("consults", []):
+        print(f"\n--- consult {consult['from_profile']} -> {consult['to_profile']} ({consult['status']})")
+        print(f"Q: {consult['question'][:500]}\nA: {(consult['answer'] or '')[:800]}")
+    for plan in reversed(detail.get("plans", [])):
+        steps = [" ".join(s.get("argv") or [s.get("task") or ""]) for s in plan["plan"]["steps"]]
+        print(f"\n--- plan v{plan['version']} risk={plan['plan']['risk']} errors={plan['errors']}\n    steps: {steps}")
+    for entry in detail.get("ledger", []):
+        data = entry["data"]
+        keep = {
+            k: data[k]
+            for k in ("cost_usd", "turns", "refusals", "usage", "version", "status", "errors", "reason")
+            if k in data
+        }
+        print(
+            f"ledger {entry['seq']:>3} {entry['kind']:<28} {entry['actor']:<22} {json.dumps(keep, ensure_ascii=False)[:200]}"
+        )
+
+
+def engine_for(name: str, kind: str) -> Engine:
+    if kind == "stub":
+        return StubEngine(infra if name == "infra" else code)
+    from airlock.runner.claude_engine import ClaudeEngine
+    from airlock.runner.sandbox import CONFINED_TOOLS
+
+    budget = float(os.environ.get("AIRLOCK_MAX_BUDGET_USD") or 1.0)
+    return ClaudeEngine(model=os.environ.get("AIRLOCK_MODEL") or None, tools=CONFINED_TOOLS, max_budget_usd=budget)
 
 
 async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--smoke", action="store_true", help="drive the flow on ephemeral ports, then exit")
+    parser.add_argument("--engine", choices=("stub", "claude"), default="stub")
     args = parser.parse_args()
+    real = args.engine == "claude"
 
     defaults = {"control": 18080, "launcher": 18090, "infra": 18101, "code": 18102}
     sockets = {name: bind(0 if args.smoke else port) for name, port in defaults.items()}
@@ -214,15 +321,25 @@ async def main() -> int:
 
     plane = ControlPlane(load_control(config, env))
     apps = {"control": create_app(plane.config, plane=plane, tick_seconds=0.5)}
-    for name, script in (("infra", infra), ("code", code)):
+    # A real engine gets working directories outside this checkout: nothing of
+    # the repository (its git metadata included) is in reach or in its prompt.
+    scratch = Path(tempfile.mkdtemp(prefix="airlock-demo-")) if real else data
+    for name in ("infra", "code"):
+        workdir = scratch / name
+        if real:
+            seed(workdir, EVIDENCE[name])
         settings = NodeConfig(
             profile=name,
             secret=env[name.upper()],
             control_url=config["control"]["base_url"],
-            engine="stub",
-            workdir=data / name,
+            engine=args.engine,
+            workdir=workdir,
+            instructions=INSTRUCTIONS[name] if real else "",
+            confine=real,
+            max_turns=25,
+            timeout_seconds=600,
         )
-        apps[name] = create_node_app(InvestigatorNode(settings, StubEngine(script)))
+        apps[name] = create_node_app(InvestigatorNode(settings, engine_for(name, args.engine)))
     launcher = Launcher(load_launcher(config, env), LocalRuntime(), engine="stub")
     apps["launcher"] = create_launcher_app(launcher, tick_seconds=2)
 
@@ -233,9 +350,11 @@ async def main() -> int:
 
     control_url = config["control"]["base_url"]
     work_id = await send_alert(control_url, env["ALERTS"])
+    if real:
+        print(f"investigators work in {scratch}")
     if args.smoke:
         try:
-            await smoke(control_url, plane, work_id)
+            await smoke(control_url, plane, work_id, real=real)
         finally:
             for server in servers.values():
                 server.should_exit = True

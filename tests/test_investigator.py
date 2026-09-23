@@ -177,7 +177,8 @@ async def test_failed_posture_refuses_work(tmp_path: Path) -> None:
 async def test_answering_a_consult_has_no_way_to_ask_a_third(tmp_path: Path) -> None:
     investigator, _, engine = node(tmp_path, lambda r: StubTurn(text="the pool is 10"))
     status, body = await investigator.answer({"work_id": "w1", "from": "code", "question": "pool size?", "context": {}})
-    assert (status, body) == (200, {"answer": "the pool is 10"}) and engine.requests[0].consult is None
+    assert status == 200 and body["answer"] == "the pool is 10" and engine.requests[0].consult is None
+    assert set(body) == {"answer", "cost_usd", "turns", "usage"}
 
 
 async def test_the_doors_need_the_profile_secret(tmp_path: Path) -> None:
