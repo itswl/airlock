@@ -124,6 +124,10 @@ CREATE TABLE IF NOT EXISTS outbox (
     sent_at REAL
 );
 CREATE INDEX IF NOT EXISTS outbox_due ON outbox(status, next_at);
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 # A work item in one of these is finished. A new signal with the same key after

@@ -1,0 +1,9 @@
+# An investigator: the airlock image plus the Claude Agent SDK, which bundles
+# the Claude Code CLI. Add the read-only tools this profile investigates with
+# (kubectl, the AWS CLI, ...) on top, and nothing that writes.
+ARG BASE=airlock:0.1
+FROM ${BASE}
+USER 0
+RUN pip install --no-cache-dir 'claude-agent-sdk>=0.2.158'
+USER 10001
+CMD ["python", "-m", "airlock.runner.investigator", "--port", "8100"]

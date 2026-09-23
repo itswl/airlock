@@ -169,7 +169,16 @@ async def test_the_whole_path_from_signal_to_done(h: Harness) -> None:
 
     await h.plane.tick()
     events = [r.headers["X-Airlock-Event"] for r in h.hooks]
-    assert events == ["work.created", "plan.ready", "work.approved", "run.started", "run.finished", "ledger.checkpoint"]
+    # The first tick hands the witness a head at once; every run's end hands it another.
+    assert events == [
+        "work.created",
+        "ledger.checkpoint",
+        "plan.ready",
+        "work.approved",
+        "run.started",
+        "run.finished",
+        "ledger.checkpoint",
+    ]
     for request in h.hooks:
         verify(h.env["T_HOOKS"], request.content, request.headers, now=h.clock())
 

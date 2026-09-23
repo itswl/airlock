@@ -14,6 +14,7 @@ from airlock.egress import proxy
 
 class Echo(socketserver.BaseRequestHandler):
     def handle(self) -> None:
+        self.request.settimeout(5)
         data = self.request.recv(1024)
         self.request.sendall(b"echo:" + data)
 
@@ -84,3 +85,19 @@ def test_plain_http_is_checked_against_the_same_list(servers: tuple[int, int]) -
     answer, client = ask(gateway, f"GET http://attacker.invalid:{upstream}/x HTTP/1.1\r\n\r\n".encode())
     client.close()
     assert answer.startswith(b"HTTP/1.1 403")
+
+
+def test_bytes_sent_right_behind_the_connect_are_not_lost(servers: tuple[int, int]) -> None:
+    # Some clients start TLS without waiting for "200 Connection established":
+    # whatever arrived with the request head must be passed on, not left in a buffer.
+    gateway, upstream = servers
+    client = socket.create_connection(("127.0.0.1", gateway), timeout=5)
+    client.sendall(f"CONNECT 127.0.0.1:{upstream} HTTP/1.1\r\nHost: x\r\n\r\n".encode() + b"early")
+    received = b""
+    while b"echo:" not in received:
+        chunk = client.recv(1024)
+        if not chunk:
+            break
+        received += chunk
+    client.close()
+    assert received.startswith(b"HTTP/1.1 200") and received.endswith(b"echo:early"), received

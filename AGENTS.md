@@ -23,10 +23,12 @@ must keep that true. Before you touch anything, know which side you are on.
 - **Tests never touch the outside.** No network beyond loopback, no Docker, no
   model, no credentials, nothing outside pytest's tmp directory. A command a
   test expects to be refused must be harmless if a bug let it run.
-- **Say what was not run.** The Docker runtime and `deploy/` are tested only as
-  far as their wiring; the Claude engine has run for real only confined on a
-  host (`scripts/demo.py --engine claude`). A change there is not verified until
-  it has run for real, and a PR says which.
+- **Say what was not run.** Docker and `deploy/` have run for real on one
+  machine (`AIRLOCK_DOCKER_TESTS=1 pytest tests/test_docker.py`,
+  `python scripts/compose_smoke.py`); the Claude engine has run for real only
+  confined on a host (`scripts/demo.py --engine claude`) — in a container it has
+  not, and no worker has held real credentials. A change there is not verified
+  until it has run for real, and a PR says which.
 - **A real model reads nothing it should not send.** Outside a container a real
   engine runs confined, in a working directory outside every repository, with
   a curated environment. What a tool reads is sent to the model provider.

@@ -1017,10 +1017,33 @@ class ControlPlane:
             status=status,
             groups=groups,
         )
-        self.outbox.enqueue(
-            "ledger.checkpoint", {"head": self.ledger.head(), "work_id": approval["work_id"]}, now=self.clock()
-        )
+        self.checkpoint(work_id=approval["work_id"])
         return Outcome(200, {"status": "recorded"})
+
+    def checkpoint(self, *, work_id: str | None = None) -> dict[str, Any]:
+        """Hand the ledger's head to whoever keeps it (a witness subscribed to ledger.checkpoint).
+
+        A ledger edited after this can no longer show this hash at this seq,
+        even if somebody rebuilt a self-consistent chain around the edit.
+        """
+        last = self.ledger.last()
+        payload = {"seq": last["seq"], "head": last["hash"], "ledger_ts": last["ts"], "work_id": work_id}
+        self.outbox.enqueue("ledger.checkpoint", payload, now=self.clock())
+        self.db.execute(
+            "INSERT INTO meta (key, value) VALUES ('checkpoint', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [json.dumps({"seq": last["seq"], "at": self.clock()})],
+        )
+        return payload
+
+    def checkpoint_due(self) -> dict[str, Any] | None:
+        """A checkpoint every ``checkpoint_seconds`` while the ledger grows, runs or no runs."""
+        row = self.db.one("SELECT value FROM meta WHERE key = 'checkpoint'")
+        previous = json.loads(row["value"]) if row else {"seq": 0, "at": 0.0}
+        if self.ledger.last()["seq"] <= previous["seq"]:
+            return None
+        if self.clock() - previous["at"] < self.config.checkpoint_seconds:
+            return None
+        return self.checkpoint()
 
     # ------------------------------------------------------------------ reading
 
@@ -1071,6 +1094,7 @@ class ControlPlane:
         self.expire_investigations()
         self.expire_approvals()
         await self.launch_due()
+        self.checkpoint_due()
         await self.outbox.deliver_due(self.client, now=self.clock())
 
     async def close_all(self) -> None:

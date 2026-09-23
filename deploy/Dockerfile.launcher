@@ -1,0 +1,9 @@
+# The launcher: the airlock image plus the Docker CLI, because starting worker
+# containers is its job. It is the only image that ever gets the Docker socket,
+# and whoever holds that socket holds the host — keep it on a network only the
+# control plane can reach.
+ARG BASE=airlock:0.1
+FROM docker:29-cli AS docker
+FROM ${BASE}
+COPY --from=docker /usr/local/bin/docker /usr/local/bin/docker
+CMD ["python", "-m", "airlock.launcher", "--config", "/etc/airlock/config.yaml", "--host", "0.0.0.0"]

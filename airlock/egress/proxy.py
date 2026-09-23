@@ -79,6 +79,11 @@ def _pump(a: socket.socket, b: socket.socket) -> None:
 
 class Handler(socketserver.StreamRequestHandler):
     timeout = 30
+    # Unbuffered: the request head is read byte by byte, so nothing that came
+    # after it is left in a buffer the tunnel never reads. Some clients start
+    # TLS without waiting for the 200 — with a buffered reader their
+    # ClientHello vanished and the connection hung until the idle timeout.
+    rbufsize = 0
 
     def handle(self) -> None:
         try:

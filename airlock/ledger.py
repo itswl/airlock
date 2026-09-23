@@ -74,6 +74,14 @@ class Ledger:
         row = self.db.one("SELECT hash FROM ledger ORDER BY seq DESC LIMIT 1")
         return row["hash"] if row else SEED
 
+    def last(self) -> dict[str, Any]:
+        """The newest entry's position and hash: what a checkpoint hands to a witness."""
+        row = self.db.one("SELECT seq, hash, ts FROM ledger ORDER BY seq DESC LIMIT 1")
+        return dict(row) if row else {"seq": 0, "hash": SEED, "ts": 0.0}
+
+    def at(self, seq: int) -> dict[str, Any] | None:
+        return self.db.one("SELECT seq, hash, ts, kind FROM ledger WHERE seq = ?", [seq])
+
     def entries(self, *, work_id: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
         if work_id is None:
             rows = self.db.all("SELECT * FROM ledger ORDER BY seq DESC LIMIT ?", [limit])

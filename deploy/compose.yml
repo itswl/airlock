@@ -1,5 +1,13 @@
-# A sketch of one host running airlock. It has NOT been run as written: read
-# it, adapt it, and check each boundary on your host before trusting it.
+# One host running airlock. `scripts/compose_smoke.py` runs this file as it is
+# (stub engines, a harmless worker) and checks the flow and the network split;
+# with real credentials and models, check each boundary on your host again.
+#
+# Parameters (environment or an .env next to it):
+#   AIRLOCK_ROOT           host directory for data, runs, credentials, work (default /opt/airlock)
+#   AIRLOCK_IMAGE, AIRLOCK_LAUNCHER_IMAGE, AIRLOCK_INVESTIGATOR_IMAGE
+#   AIRLOCK_CONSOLE_PORT   where the console listens on 127.0.0.1 (default 8080)
+#   DOCKER_GID             the group that owns the Docker socket (0 on Docker Desktop / OrbStack)
+#   AIRLOCK_EGRESS_ALLOW   the hosts investigators may reach through the proxy (the model gateway among them)
 #
 # Four networks, so that who can reach whom is the diagram, not a hope:
 #   investigate  control plane <-> investigators
@@ -19,34 +27,35 @@ networks:
 
 services:
   control:
-    image: airlock:0.1
+    image: ${AIRLOCK_IMAGE:-airlock:0.1}
     command: [python, -m, airlock.control, --config, /etc/airlock/config.yaml, --host, 0.0.0.0, --port, "8080"]
     env_file: control.env              # AIRLOCK_SESSION_SECRET, AIRLOCK_OPERATOR_PASSWORD_HASH, AIRLOCK_LAUNCHER_SECRET, source and investigator secrets
     volumes:
       - ./config.yaml:/etc/airlock/config.yaml:ro
-      - /opt/airlock/data:/opt/airlock/data
+      - ${AIRLOCK_ROOT:-/opt/airlock}/data:${AIRLOCK_ROOT:-/opt/airlock}/data
     ports:
-      - "127.0.0.1:8080:8080"          # put TLS and your SSO / VPN in front; this is the approval button
+      - "127.0.0.1:${AIRLOCK_CONSOLE_PORT:-8080}:8080"   # put TLS and your SSO / VPN in front; this is the approval button
     networks: [investigate, launch, outside]
     restart: unless-stopped
 
   launcher:
-    image: airlock:0.1
+    image: ${AIRLOCK_LAUNCHER_IMAGE:-airlock-launcher:0.1}   # deploy/Dockerfile.launcher: airlock + the Docker CLI
     command: [python, -m, airlock.launcher, --config, /etc/airlock/config.yaml, --host, 0.0.0.0, --port, "8090"]
     env_file: launcher.env             # AIRLOCK_LAUNCHER_SECRET only
-    user: "10001:${DOCKER_GID}"        # may use the Docker socket; nothing else here may
+    user: "10001:10001"
+    group_add: ["${DOCKER_GID:-0}"]    # may use the Docker socket; nothing else here may
     volumes:
       - ./config.yaml:/etc/airlock/config.yaml:ro
       - /var/run/docker.sock:/var/run/docker.sock
       # The same path inside and outside: the Docker daemon resolves the run
       # directory and the credential directories as HOST paths.
-      - /opt/airlock/runs:/opt/airlock/runs
-      - /opt/airlock/data:/opt/airlock/data
+      - ${AIRLOCK_ROOT:-/opt/airlock}/runs:${AIRLOCK_ROOT:-/opt/airlock}/runs
+      - ${AIRLOCK_ROOT:-/opt/airlock}/data:${AIRLOCK_ROOT:-/opt/airlock}/data
     networks: [launch]
     restart: unless-stopped
 
   investigator-infra:
-    image: airlock-investigator:0.1    # FROM airlock:0.1 + 'airlock[claude]' + kubectl + aws CLI
+    image: ${AIRLOCK_INVESTIGATOR_IMAGE:-airlock-investigator:0.1}    # FROM airlock:0.1 + 'airlock[claude]' + kubectl + aws CLI
     command: [python, -m, airlock.runner.investigator, --port, "8100"]
     environment:
       AIRLOCK_PROFILE: infra
@@ -69,9 +78,9 @@ services:
       - ./profiles/posture-infra.yaml:/etc/airlock/posture-infra.yaml:ro
       - ./profiles/mcp-infra.json:/etc/airlock/mcp-infra.json:ro
       - ./profiles/skills-infra:/work/.claude/skills:ro          # SKILL.md files, one directory per skill
-      - /opt/airlock/creds/investigator-infra:/creds:ro   # READ-ONLY identities only
-      - /opt/airlock/work/infra:/work
-      - /opt/airlock/state/infra:/state
+      - ${AIRLOCK_ROOT:-/opt/airlock}/creds/investigator-infra:/creds:ro   # READ-ONLY identities only
+      - ${AIRLOCK_ROOT:-/opt/airlock}/work/infra:/work
+      - ${AIRLOCK_ROOT:-/opt/airlock}/state/infra:/state
     read_only: true
     tmpfs: [/tmp]
     cap_drop: [ALL]
@@ -80,7 +89,7 @@ services:
     restart: unless-stopped
 
   investigator-code:
-    image: airlock-investigator:0.1
+    image: ${AIRLOCK_INVESTIGATOR_IMAGE:-airlock-investigator:0.1}
     command: [python, -m, airlock.runner.investigator, --port, "8100"]
     environment:
       AIRLOCK_PROFILE: code
@@ -92,9 +101,9 @@ services:
       NO_PROXY: control
     env_file: investigator-code.env
     volumes:
-      - /opt/airlock/code:/work/code:ro   # the repositories it reads; the :ro is the boundary
-      - /opt/airlock/work/code:/work
-      - /opt/airlock/state/code:/state
+      - ${AIRLOCK_ROOT:-/opt/airlock}/code:/work/code:ro   # the repositories it reads; the :ro is the boundary
+      - ${AIRLOCK_ROOT:-/opt/airlock}/work/code:/work
+      - ${AIRLOCK_ROOT:-/opt/airlock}/state/code:/state
     read_only: true
     tmpfs: [/tmp]
     cap_drop: [ALL]
@@ -103,10 +112,10 @@ services:
     restart: unless-stopped
 
   egress:
-    image: airlock:0.1
+    image: ${AIRLOCK_IMAGE:-airlock:0.1}
     command: [python, -m, airlock.egress.proxy]
     environment:
-      EGRESS_ALLOW: api.anthropic.com,.amazonaws.com,api.github.com,github.com
+      EGRESS_ALLOW: ${AIRLOCK_EGRESS_ALLOW:-api.anthropic.com,.amazonaws.com,api.github.com,github.com}
       EGRESS_PORTS: "443"
     networks: [egress, outside]
     read_only: true

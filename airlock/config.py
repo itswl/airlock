@@ -133,6 +133,7 @@ class ControlConfig:
     max_consults: int = 5
     max_auto_revisions: int = 2
     investigation_timeout_seconds: int = 3600
+    checkpoint_seconds: int = 3600
 
     @property
     def cookie_secure(self) -> bool:
@@ -332,6 +333,7 @@ def load_control(source: str | Path | Mapping[str, Any], env: Mapping[str, str] 
         max_consults=int(control.get("max_consults", 5)),
         max_auto_revisions=int(control.get("max_auto_revisions", 2)),
         investigation_timeout_seconds=int(control.get("investigation_timeout_seconds", 3600)),
+        checkpoint_seconds=int(control.get("checkpoint_seconds", 3600)),
     )
 
 

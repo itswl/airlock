@@ -135,7 +135,9 @@ CLI 报的 `cost_usd` 是它按自己的价目表估的，续接的会话里还�
 - `config.example.yaml`：带注释的完整配置（来源、路由、调查画像、工作画像、订阅、适配器）。密钥只写环境变量名。
 - 进程：`python -m airlock.control --config config.yaml`、`python -m airlock.launcher --config config.yaml`、每个调查画像一个 `python -m airlock.runner.investigator`（环境变量配置，见 `airlock/runner/investigator.py` 顶部），出网代理 `python -m airlock.egress.proxy`。
 - 操作员密码：`python -m airlock.control.passwd` 生成 scrypt 哈希，放进 `AIRLOCK_OPERATOR_PASSWORD_HASH`。
-- `deploy/Dockerfile`、`deploy/compose.yml`：镜像和单机编排的**草图**，四个网络把「谁能连谁」固定成上面的图（调查员连不到启动器）。**没有实际跑过**，上线前要逐条核对。
+- `deploy/Dockerfile`（通用镜像）、`deploy/Dockerfile.launcher`（加 Docker CLI，只有它拿 Docker socket）、`deploy/Dockerfile.investigator`（加 Claude Agent SDK）、`deploy/compose.yml`（单机编排，四个网络把「谁能连谁」固定成上面的图）。
+- `python scripts/compose_smoke.py`：按原样起这个 compose（桩引擎、只跑 echo 的工作画像），走一遍"信号 → 容器里的调查员 → 批准 → 启动器在容器里起工作容器 → 记录"，再从调查员容器里验证网络切分，最后全部拆掉。2026-09-23 在本机 Docker（OrbStack）上通过。
+- 容器边界的实测：`AIRLOCK_DOCKER_TESTS=1 pytest tests/test_docker.py`，用工作画像的姿态自检从容器里面逐条证明：非 root、根文件系统只读、无网络、无任何 capability、no-new-privileges、凭证只读、/tmp 不可执行、进程数和内存上限；外加超时、急停、启动器重启后清理在途容器、调查员网络只经代理出网。
 
 真正让边界成立的是你要准备的东西，代码替你做不了：
 
@@ -152,19 +154,26 @@ CLI 报的 `cost_usd` 是它按自己的价目表估的，续接的会话里还�
 
 已实现并有测试（`pytest` 覆盖各模块和一个全链路 e2e；`scripts/demo.py --smoke` 另用真实的多个 HTTP 服务走一遍）：管道进口与出口、路由、调查节点、会诊中转、计划校验与版本、网页控制台、审批绑定、启动器复核、本地运行时、执行器、姿态自检、账本与执行记录的哈希链、出网代理。
 
+Docker 真跑过的（2026-09-23，本机 OrbStack）：容器边界实测、超时/急停/重启清理、出网只经代理、`deploy/compose.yml` 整套起来走通一次（桩引擎）。
+
 真模型跑过的（2026-09-23，经 LiteLLM 用 `gpt-5.6-luna`，Claude Agent SDK 0.2.158 / CLI 2.1.280，受限模式在本机）：`scripts/demo.py --smoke --engine claude` 全流程走通——调查员读证据、经控制面会诊另一个调查员、给出能过校验的计划、按留言修订出新版本、批准后执行；另外单独验证了钩子的拒绝真的挡住 CLI（工作目录外的诱饵文件、`kubectl delete` 都被拒，内容没有到模型那里）。
 
 写了但**没有真跑过**的：
 
-- Docker 运行时：`docker run` 的参数有测试，但没有在 Docker 上跑过一个真容器。
-- 容器里的调查员和 task 模式的工作画像（真模型只在本机受限模式下跑过）。
-- `deploy/` 下的镜像和编排。
+- 容器里的调查员配真模型：镜像和流程都就绪，但这台 Mac 上 OrbStack 容器到模型网关的 TLS 握手不通（Mac 本机直连正常，容器连别的站点正常，本机 hookstack 工作栈的出网代理也一样不通），换一台 Linux 机器或理顺容器网络后再验证。
+- task 模式的工作画像配真模型。
+- 真实凭证的工作画像（等你建专用身份）。
 
 MCP 和 skills 已实现并在真 CLI 上验证（见上文）。
 
+也已经做了：
+
+- 链头见证：`python -m airlock.witness serve` 收下每个 `ledger.checkpoint`，`python -m airlock.witness verify` 用它们核对账本——改了记录又把后面的 hash 全部重算、自己校验完全通过的账本，在见证过的序号上对不上。
+- 原生审计对账：`python -m airlock.reconcile` 读 CloudTrail 导出或 k8s 审计日志，专用身份的每一次调用都要落在一次批准过的执行窗口里（AWS 还要对上 User-Agent 里的批准编号），对不上就列出来、退出码 1。怎么定时拉日志是部署的事。
+- System-1 决策模型评估（`scripts/eval_system_one.py`）：Laya 零样本在告警分诊上不如直接用告警自带级别（15/52 对 28/52），命令分类把一半破坏性命令判成只读——暂不接入。
+
 还**没有做**的：
 
-- 用目标系统的原生审计（CloudTrail、k8s audit）对账：专用身份的每一次使用都应能对上一条执行记录，对不上就报警。现在只做了「带上批准编号」这一半。
 - 任何具体的适配器（飞书等）：协议有了（签名通知 + `/v1/adapters/<name>/message|decision` + 平台用户映射），适配器本身没写。
 - 让批准在密码学上只属于你：现在启动器信任控制面的签名，控制面被攻破就能伪造批准。下一步是用只在你设备上的密钥（WebAuthn）签计划 hash，启动器验这个签名。
 - 多操作员、按风险要求二次确认。

@@ -34,6 +34,8 @@ Configuration is the environment, because a node is a container:
     AIRLOCK_MAX_CONCURRENT     investigations at once (default 2)
     AIRLOCK_MODEL              model name for the claude engine
     AIRLOCK_MAX_BUDGET_USD     per-turn spending cap the claude engine enforces
+    AIRLOCK_STUB_REPLY_FILE    with AIRLOCK_ENGINE=stub: every investigation answers with this file's text
+                               (smoke tests of a deployment; no model is called)
     AIRLOCK_CONFINE            1 when the node runs on a host rather than in its own container:
                                tools only inside the working directory, read-only shell (airlock.runner.sandbox)
 """
@@ -113,6 +115,7 @@ class NodeConfig:
     mcp_config: Path | None = None
     skills: tuple[str, ...] = ()
     state_dir: Path | None = None
+    stub_reply: Path | None = None
 
 
 def load_node(env: Mapping[str, str] | None = None) -> NodeConfig:
@@ -148,6 +151,7 @@ def load_node(env: Mapping[str, str] | None = None) -> NodeConfig:
         mcp_config=mcp_config,
         skills=tuple(s.strip() for s in env.get("AIRLOCK_SKILLS", "").split(",") if s.strip()),
         state_dir=Path(env["AIRLOCK_STATE_DIR"]) if env.get("AIRLOCK_STATE_DIR") else None,
+        stub_reply=Path(env["AIRLOCK_STUB_REPLY_FILE"]) if env.get("AIRLOCK_STUB_REPLY_FILE") else None,
     )
 
 
@@ -530,7 +534,12 @@ def create_node_app(node: InvestigatorNode) -> FastAPI:
 
 def build_engine(config: NodeConfig) -> Engine:
     if config.engine == "stub":
-        return StubEngine(lambda request: StubTurn(text="stub engine: no investigation was run"))
+        reply = config.stub_reply
+        return StubEngine(
+            lambda request: StubTurn(
+                text=reply.read_text(encoding="utf-8") if reply else "stub engine: no investigation was run"
+            )
+        )
     from airlock.runner.claude_engine import BUILTIN_TOOLS, ClaudeEngine
     from airlock.runner.sandbox import CONFINED_TOOLS
 
