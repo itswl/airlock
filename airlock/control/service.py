@@ -61,6 +61,12 @@ class Outcome:
         return 200 <= self.status < 300
 
 
+def _workspace_summary(workspace: Mapping[str, Any]) -> dict[str, Any]:
+    """What the ledger keeps of a group's change: which repository, how big, and the hash of the diff itself."""
+    keep = ("repo", "start", "files_changed", "insertions", "deletions", "patch_sha256", "truncated", "error")
+    return {k: workspace[k] for k in keep if k in workspace}
+
+
 class ControlPlane:
     def __init__(
         self,
@@ -993,6 +999,7 @@ class ControlPlane:
                 "record_head": g.get("record_head"),
                 "record_intact": g.get("record_intact"),
                 "steps": len(g.get("steps") or []),
+                **({"workspace": _workspace_summary(g["workspace"])} if isinstance(g.get("workspace"), dict) else {}),
             }
             for g in payload.get("groups") or []
             if isinstance(g, dict)

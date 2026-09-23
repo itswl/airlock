@@ -51,7 +51,7 @@
                                            +--------------------+-------------+------+
                                            v                    v                    v
 操作区                            +------------------+ +------------------+ +------------------+
-凭证常驻，权限收窄                | 工作画像 k8s-ops | | 工作画像 aws-ops | | 工作画像 repo    |
+凭证常驻，权限收窄                | 工作画像 k8s-ops | | 工作画像 aws-ops | | 工作画像 code    |
 每组先自检身份，不对不跑          | 命令白名单       | | 命令白名单       | | task 模式        |
 默认照单执行，精确 argv           | 专用机器身份     | | 专用机器身份     | | 灾难底线守卫     |
 网络按画像给，默认无网            | 做完即删         | | 做完即删         | | 做完即删         |
@@ -108,7 +108,7 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 
 ```bash
 pip install -e '.[claude]'          # Claude Agent SDK，自带 Claude Code CLI
-export ANTHROPIC_BASE_URL=…  ANTHROPIC_AUTH_TOKEN=…  AIRLOCK_MODEL=…   # 任何 Anthropic 兼容网关
+export ANTHROPIC_BASE_URL=…  ANTHROPIC_AUTH_TOKEN=…  AIRLOCK_MODEL=…   # 任何 Anthropic 兼容网关，比如 DeepSeek 的 /anthropic
 .venv/bin/python scripts/demo.py --engine claude
 ```
 
@@ -148,6 +148,27 @@ CLI 报的 `cost_usd` 是它按自己的价目表估的，续接的会话里还�
 
 `python scripts/mcpgate_check.py [--engine claude]` 用演示 MCP 服务器真跑一遍，服务器用的是有会话、SSE 流的默认模式。原始协议和真 CLI 都只看得到放行的那个工具；越权调用被网关拒掉，服务器日志里没有这次调用。
 
+## 改代码的工作画像
+
+工作画像用 `repos` 列出它能改的仓库（名字 → 一个本地 git 仓库，一般是你定时 fetch 的镜像）。计划里给它的步骤目标写成 `repo:<名字>`：
+
+- **每次运行一份新克隆。** 容器启动前由启动器克隆，删掉 remote。worker 提交的东西到不了镜像，push 无处可去，下一次运行又从干净的状态开始。
+- **改了什么由启动器算，不由 worker 报。** 一组跑完，启动器拿镜像里起点那次提交的文件，和工作区当前的文件比，算出 diff，连同 hash 存进运行目录，控制台的执行结果里能直接看到。
+- **不在工作区里跑 git。** worker 整个运行期间都能改工作区的 `.git/config` 和 `.gitattributes`，而 git 会执行那里写的程序（`core.fsmonitor`、filter、diff 驱动）。启动器要是在那里跑 `git diff`，就等于在容器外、挨着 Docker socket 执行 worker 的代码。所以工作区只当普通文件读：跳过 `.git`，符号链接只记指向，不读链接后面的内容。
+- **模型设置放在它自己的凭证目录里**（`engine.env`）；`instructions` 是你给这个画像定的规矩，每个 task 步骤都会带上。
+
+`python scripts/compose_smoke.py --code` 真跑一遍：桩调查员出一份计划，让 `code` 画像修一个编造仓库里的 bug；worker 在容器里用真模型改代码、跑测试、提交，只能经出网代理访问模型。2026-09-23 在本机用 DeepSeek 跑通：
+- 启动器算出的改动正好是修复加一个新测试（2 个文件，+7 −1）；
+- 镜像仓库没有动；
+- worker 自己报告测试跑过、已提交。
+
+## 核心之外
+
+airlock 只做一条线：信号进来 → 调查 → 计划 → 你批准 → 隔离执行 → 记录。其他事情都在它外面做，就像 hookstack 里很多部件是外部脚本和旁车：
+- 盯守聊天、定时巡检，是往入口发签名 webhook 的**来源**，比如 `deploy/host/patrol.py`；
+- 飞书卡片、每日摘要，是订阅出口签名通知的**订阅方**，回传留言和批准走适配器协议；
+- 自检和告警是外部的定时任务，查 `/healthz` 和账本即可。
+
 ## 部署
 
 - `config.example.yaml`：带注释的完整配置（来源、路由、调查画像、工作画像、订阅、适配器）。密钥只写环境变量名。
@@ -155,8 +176,8 @@ CLI 报的 `cost_usd` 是它按自己的价目表估的，续接的会话里还�
 - 操作员密码：`python -m airlock.control.passwd` 生成 scrypt 哈希，放进 `AIRLOCK_OPERATOR_PASSWORD_HASH`。
 - 镜像：
   - `deploy/Dockerfile`：通用镜像；
-  - `deploy/Dockerfile.launcher`：加 Docker CLI，只有它拿 Docker socket；
-  - `deploy/Dockerfile.investigator`：加 Claude Agent SDK；
+  - `deploy/Dockerfile.launcher`：加 Docker CLI（只有它拿 Docker socket）和 git（克隆仓库、读镜像）；
+  - `deploy/Dockerfile.investigator`：加 Claude Agent SDK 和 git，task 模式的工作画像也用它；
   - `deploy/Dockerfile.worker-ssh`：加 OpenSSH 客户端，给经 SSH 做事的工作画像。
 - 编排：`deploy/compose.yml` 是单机编排，五个网络把「谁能连谁」固定成上面的图；MCP 网关按需打开。
 - `deploy/host/`：一个工作画像只能碰主机的一小块时的做法。
@@ -180,7 +201,13 @@ CLI 报的 `cost_usd` 是它按自己的价目表估的，续接的会话里还�
 
 已实现并有测试（`pytest` 覆盖各模块和一个全链路 e2e；`scripts/demo.py --smoke` 另用真实的多个 HTTP 服务走一遍）：管道进口与出口、路由、调查节点、会诊中转、计划校验与版本、网页控制台、审批绑定、启动器复核、本地运行时、执行器、姿态自检、账本与执行记录的哈希链、出网代理。
 
-Docker 真跑过的（2026-09-23，本机 OrbStack）：容器边界实测、超时/急停/重启清理、出网只经代理、`deploy/compose.yml` 整套起来走通一次（桩引擎）。
+Docker 真跑过的（2026-09-23，本机 OrbStack）：
+- 容器边界实测，超时、急停、重启后清理；
+- 出网只经代理；
+- `deploy/compose.yml` 整套起来的三种跑法：
+  - 桩引擎；
+  - `--engine claude`：infra 调查员在容器里用真模型（DeepSeek，经出网代理），读了证据和 skill，出的计划是先把连接池上限调回去再重启，批准后执行；
+  - `--code`：改代码的工作画像在容器里用真模型，见上文。
 
 在一台 Linux 云服务器上真跑过（2026-09-23，Docker Compose 2.32）：`deploy/compose.yml` 常驻运行，infra 调查员在容器里配真模型，走完了一次完整的巡检流程：
 
@@ -195,11 +222,10 @@ MCP 网关也在那台服务器上接好了，见上文。
 
 真模型跑过的（2026-09-23，经 LiteLLM 用 `gpt-5.6-luna`，Claude Agent SDK 0.2.158 / CLI 2.1.280，受限模式在本机）：`scripts/demo.py --smoke --engine claude` 全流程走通——调查员读证据、经控制面会诊另一个调查员、给出能过校验的计划、按留言修订出新版本、批准后执行；另外单独验证了钩子的拒绝真的挡住 CLI（工作目录外的诱饵文件、`kubectl delete` 都被拒，内容没有到模型那里）。
 
-这台 Mac 上 OrbStack 的容器到模型网关 TLS 握手不通：Mac 本机直连正常，容器连别的站点也正常，本机 hookstack 工作栈的出网代理一样不通。所以容器里配真模型的验证都在云服务器上做。
+这台 Mac 上的容器连某一个模型网关会间歇性卡在 TLS 或 HTTP 上：TCP 能连通，Mac 本机和云服务器访问同一个网关都正常，把容器网络的 MTU 降到 1280 也没用。连 DeepSeek 正常，所以本机的真模型验证改用 DeepSeek。
 
 写了但**没有真跑过**的：
 
-- task 模式的工作画像配真模型。
 - 云上的专用身份（AWS、K8s 的工作画像）：等你建身份。真正持有过凭证的工作画像目前只有上面那把受限 SSH key。
 - 对账读真实的 CloudTrail 或 k8s 审计日志：目前只在测试数据上跑过。
 
@@ -213,7 +239,7 @@ MCP 和 skills 已实现并在真 CLI 上验证（见上文）。
 
 还**没有做**的：
 
-- 任何具体的适配器（飞书等）：协议有了（签名通知 + `/v1/adapters/<name>/message|decision` + 平台用户映射），适配器本身没写。
+- 具体的适配器（飞书等）：按上面「核心之外」的分工，适配器在 airlock 外面做。协议已经有了：签名通知、`/v1/adapters/<name>/message|decision`、平台用户映射。
 - 让批准在密码学上只属于你：现在启动器信任控制面的签名，控制面被攻破就能伪造批准。下一步是用只在你设备上的密钥（WebAuthn）签计划 hash，启动器验这个签名。
 - 多操作员、按风险要求二次确认。
 

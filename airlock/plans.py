@@ -21,6 +21,8 @@ from airlock.config import WorkerProfile
 from airlock.crypto import canonical_json, sha256_hex
 from airlock.runner.guard import DANGER_ONLY, bash_deny_reason
 
+REPO_TARGET = "repo:"  # a step on a worker with repositories targets repo:<name>
+
 
 class PlanError(ValueError):
     """The text does not contain a usable plan. The message is written for the investigator to act on."""
@@ -87,6 +89,13 @@ def validate_plan(plan: Plan, workers: Mapping[str, WorkerProfile]) -> list[str]
         if step.mode not in profile.modes:
             errors.append(f"step {index}: worker {step.worker} does not run {step.mode} steps")
             continue
+        if profile.repos:
+            repo = step.target[len(REPO_TARGET) :] if step.target.startswith(REPO_TARGET) else None
+            if repo not in profile.repos:
+                names = ", ".join(f"{REPO_TARGET}{r}" for r in sorted(profile.repos))
+                errors.append(
+                    f"step {index}: worker {step.worker} changes repositories, so its target is one of {names}"
+                )
         if step.mode == "commands":
             text = step.command_text
             if not profile.allows_command(text):
@@ -108,14 +117,19 @@ def validate_plan(plan: Plan, workers: Mapping[str, WorkerProfile]) -> list[str]
 
 
 def groups(plan: Plan) -> list[dict[str, Any]]:
-    """Consecutive steps on the same worker, in order. Each group becomes one container."""
+    """Consecutive steps on the same worker, in order. Each group becomes one container.
+
+    A container mounts one repository, so consecutive steps on different
+    ``repo:`` targets are separate groups even when the worker is the same.
+    """
     result: list[dict[str, Any]] = []
     for index, step in enumerate(plan.steps, start=1):
         entry = {"index": index, **step.model_dump(mode="json")}
-        if result and result[-1]["worker"] == step.worker:
+        repo = step.target if step.target.startswith(REPO_TARGET) else None
+        if result and result[-1]["worker"] == step.worker and result[-1]["repo"] == repo:
             result[-1]["steps"].append(entry)
         else:
-            result.append({"worker": step.worker, "steps": [entry]})
+            result.append({"worker": step.worker, "repo": repo, "steps": [entry]})
     return result
 
 

@@ -4,6 +4,8 @@
 ARG BASE=airlock:0.1
 FROM ${BASE}
 USER 0
-RUN pip install --no-cache-dir 'claude-agent-sdk>=0.2.158'
+# git too: the same image runs task-mode workers, which commit in their workspace.
+RUN pip install --no-cache-dir 'claude-agent-sdk>=0.2.158' \
+ && apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 USER 10001
 CMD ["python", "-m", "airlock.runner.investigator", "--port", "8100"]

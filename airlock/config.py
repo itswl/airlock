@@ -72,6 +72,15 @@ class InvestigatorProfile:
 
 @dataclass(frozen=True)
 class WorkerProfile:
+    """What one kind of worker may do, and what its container is given.
+
+    ``repos`` names the repositories this worker may change (name → a local git
+    repository, usually a mirror). A step for it targets ``repo:<name>``; every
+    run gets a fresh clone of that repository with no remote, and the launcher
+    keeps what changed (airlock.launcher.workspace). ``instructions`` is added to
+    every task step's prompt: the operator's rules for this worker, not the plan's.
+    """
+
     name: str
     modes: tuple[str, ...] = ("commands",)
     allowed_permissions: tuple[str, ...] = ()
@@ -79,6 +88,8 @@ class WorkerProfile:
     image: str = "airlock-runner:latest"
     credentials_dir: str | None = None
     workspace_dir: str | None = None
+    repos: Mapping[str, str] = field(default_factory=dict)
+    instructions: str = ""
     network: str | None = None
     env: Mapping[str, str] = field(default_factory=dict)
     posture_checks: tuple[Mapping[str, Any], ...] = ()
@@ -203,6 +214,18 @@ def _workers(raw: list[Mapping[str, Any]]) -> dict[str, WorkerProfile]:
         for check in checks:
             if not isinstance(check.get("argv"), list) or not check.get("expect"):
                 raise ConfigError(f"worker {name}: each posture check needs argv (a list) and expect (a regex)")
+        repos = item.get("repos") or {}
+        if not isinstance(repos, Mapping):
+            raise ConfigError(f"worker {name}: repos maps a name to a local git repository")
+        for repo, path in repos.items():
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", str(repo)):
+                raise ConfigError(f"worker {name}: repository name {repo!r} must be letters, digits, ., - or _")
+            if not str(path).startswith("/"):
+                raise ConfigError(f"worker {name}: repository {repo} must be an absolute path")
+        if repos and item.get("workspace_dir"):
+            raise ConfigError(
+                f"worker {name}: workspace_dir and repos are two answers to one question; a worker has one of them"
+            )
         result[name] = WorkerProfile(
             name=name,
             modes=modes,
@@ -211,6 +234,8 @@ def _workers(raw: list[Mapping[str, Any]]) -> dict[str, WorkerProfile]:
             image=str(item.get("image") or "airlock-runner:latest"),
             credentials_dir=item.get("credentials_dir"),
             workspace_dir=item.get("workspace_dir"),
+            repos={str(k): str(v) for k, v in repos.items()},
+            instructions=str(item.get("instructions") or ""),
             network=item.get("network"),
             env={str(k): str(v) for k, v in (item.get("env") or {}).items()},
             posture_checks=checks,

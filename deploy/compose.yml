@@ -55,6 +55,9 @@ services:
       # directory and the credential directories as HOST paths.
       - ${AIRLOCK_ROOT:-/opt/airlock}/runs:${AIRLOCK_ROOT:-/opt/airlock}/runs
       - ${AIRLOCK_ROOT:-/opt/airlock}/data:${AIRLOCK_ROOT:-/opt/airlock}/data
+      # The repositories workers with `repos` may change: the launcher clones from
+      # here for every run and reads the start of each change back from here.
+      - ${AIRLOCK_ROOT:-/opt/airlock}/repos:${AIRLOCK_ROOT:-/opt/airlock}/repos:ro
     networks: [launch]
     restart: unless-stopped
 

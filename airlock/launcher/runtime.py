@@ -49,6 +49,8 @@ class GroupSpec:
     out_dir: Path
     engine: str = "claude"
     extra_env: Mapping[str, str] = field(default_factory=dict)
+    # The fresh clone this group works in (airlock.launcher.workspace), when its worker has repos.
+    workspace: Path | None = None
 
     @property
     def name(self) -> str:
@@ -72,9 +74,20 @@ class GroupSpec:
             # AWS CLIs and SDKs append this to their User-Agent, which CloudTrail
             # keeps: the target's own audit log then names the approval.
             "AWS_SDK_UA_APP_ID": f"airlock-{self.approval_id}",
+            # Commits made in a workspace say which worker and which approval made them.
+            "GIT_AUTHOR_NAME": f"airlock {self.worker.name}",
+            "GIT_AUTHOR_EMAIL": f"{self.worker.name}+{self.approval_id}@airlock.invalid",
+            "GIT_COMMITTER_NAME": f"airlock {self.worker.name}",
+            "GIT_COMMITTER_EMAIL": f"{self.worker.name}+{self.approval_id}@airlock.invalid",
         }
 
-    def payload(self, *, workdir: str, out_dir: str) -> dict[str, Any]:
+    def mounted_workspace(self) -> str | None:
+        """The host directory mounted as the workspace: this run's clone, or the profile's fixed directory."""
+        if self.workspace is not None:
+            return str(self.workspace.resolve())
+        return str(Path(self.worker.workspace_dir).resolve()) if self.worker.workspace_dir else None
+
+    def payload(self, *, workdir: str, out_dir: str, credentials: str | None = None) -> dict[str, Any]:
         return {
             "approval_id": self.approval_id,
             "work_id": self.work_id,
@@ -88,6 +101,9 @@ class GroupSpec:
             "steps": self.steps,
             "workdir": workdir,
             "out_dir": out_dir,
+            "instructions": self.worker.instructions,
+            "workspace_repo": self.steps[0].get("target") if self.workspace is not None else None,
+            "credentials": credentials,
         }
 
 
@@ -195,8 +211,9 @@ def docker_argv(docker_bin: str, spec: GroupSpec) -> list[str]:
     argv += ["--user", worker.user or default_user()]
     if worker.credentials_dir:
         argv += ["-v", f"{Path(worker.credentials_dir).resolve()}:{CONTAINER_CREDS}:ro"]
-    if worker.workspace_dir:
-        argv += ["-v", f"{Path(worker.workspace_dir).resolve()}:{CONTAINER_WORKSPACE}:rw"]
+    workspace = spec.mounted_workspace()
+    if workspace:
+        argv += ["-v", f"{workspace}:{CONTAINER_WORKSPACE}:rw"]
     for key, value in sorted({"HOME": "/tmp", "PYTHONDONTWRITEBYTECODE": "1", **spec.env()}.items()):  # noqa: S108
         argv += ["-e", f"{key}={value}"]
     argv += [worker.image, "python", "-m", "airlock.runner.executor"]
@@ -211,8 +228,9 @@ class DockerRuntime:
 
     async def run(self, spec: GroupSpec, on_line: OnLine) -> Exit:
         spec.out_dir.mkdir(parents=True, exist_ok=True)
-        workdir = CONTAINER_WORKSPACE if spec.worker.workspace_dir else "/tmp"  # noqa: S108
-        stdin = json.dumps(spec.payload(workdir=workdir, out_dir=CONTAINER_OUT)).encode()
+        workdir = CONTAINER_WORKSPACE if spec.mounted_workspace() else "/tmp"  # noqa: S108
+        credentials = CONTAINER_CREDS if spec.worker.credentials_dir else None
+        stdin = json.dumps(spec.payload(workdir=workdir, out_dir=CONTAINER_OUT, credentials=credentials)).encode()
         with (spec.out_dir.parent / f"group-{spec.group}.stderr").open("wb") as stderr:
             process = await asyncio.create_subprocess_exec(
                 *docker_argv(self.docker_bin, spec),
@@ -256,8 +274,10 @@ class LocalRuntime:
 
     async def run(self, spec: GroupSpec, on_line: OnLine) -> Exit:
         spec.out_dir.mkdir(parents=True, exist_ok=True)
-        workdir = spec.worker.workspace_dir or str(spec.out_dir)
-        stdin = json.dumps(spec.payload(workdir=workdir, out_dir=str(spec.out_dir))).encode()
+        workdir = spec.mounted_workspace() or str(spec.out_dir)
+        stdin = json.dumps(
+            spec.payload(workdir=workdir, out_dir=str(spec.out_dir), credentials=spec.worker.credentials_dir)
+        ).encode()
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(spec.out_dir), **spec.env()}
         if "PYTHONPATH" in os.environ:
             env["PYTHONPATH"] = os.environ["PYTHONPATH"]

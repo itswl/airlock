@@ -26,6 +26,16 @@ container: ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN and AIRLOCK_MODEL come
 from the environment, the gateway becomes the proxy's only listed host, and
 the run also checks that the model's calls went out through the proxy. The
 container sees a made-up incident and nothing else of this machine.
+
+    python scripts/compose_smoke.py --code
+
+keeps the investigator a stub and makes its plan one task step for a `code`
+worker that may change one repository: a made-up one with a bug, created for
+the smoke. The worker runs the real Claude engine in its container (the same
+three variables, handed to it as `engine.env` in its credentials directory),
+reaches the model only through the proxy, and commits in a fresh clone. The
+smoke checks that the change the launcher computed outside the container is
+the fix, and that the repository it was cloned from did not move.
 """
 
 from __future__ import annotations
@@ -69,6 +79,26 @@ REPLY = """Findings: demo/api has exhausted its connection pool since 09:12; the
 }
 ```
 """
+
+CODE_REPLY = """Findings: add() in calc.py subtracts; the tests would say so if there were any.
+
+```plan
+{
+  "summary": "Fix add() in the demo repository and give it a test",
+  "changes": "calc.py adds instead of subtracting; a new test_calc.py checks it. Nothing else changes.",
+  "risk": "low",
+  "permissions": {"code": ["repo:commit-local"]},
+  "steps": [
+    {"worker": "code", "target": "repo:demo",
+     "task": "calc.py's add() returns a - b. Make it return a + b. Add test_calc.py that asserts add(2, 3) == 5 and add(-1, 1) == 0 when run with `python3 test_calc.py`, run it, and commit both files with the message 'fix add'.",
+     "why": "add() is wrong"}
+  ],
+  "rollback": "Discard the run's clone; nothing left it.",
+  "verification": "python3 test_calc.py exits 0 in the clone."
+}
+```
+"""
+CODE_RULES = "Commit every change in your working directory. There is no remote and nothing to push."
 
 NETWORK_PROBE = """
 import socket
@@ -136,8 +166,31 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def lay_out(root: Path, port: int, real: dict[str, str] | None = None) -> dict[str, str]:
-    """Every file and directory the compose file refers to, with fresh secrets."""
+def demo_repo(path: Path) -> str:
+    """A made-up repository with one bug, for the code worker; returns its commit."""
+    path.mkdir(parents=True)
+    (path / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+    (path / "README.md").write_text("A made-up repository for the compose smoke.\n")
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "smoke",
+        "GIT_AUTHOR_EMAIL": "smoke@airlock.invalid",
+        "GIT_COMMITTER_NAME": "smoke",
+        "GIT_COMMITTER_EMAIL": "smoke@airlock.invalid",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+    }
+    for argv in (["init", "-q", "-b", "main"], ["add", "-A"], ["commit", "-qm", "start"]):
+        subprocess.run(["git", *argv], cwd=path, env=env, check=True, capture_output=True)
+    for item in [path, *path.rglob("*")]:
+        item.chmod(0o755 if item.is_dir() else 0o644)  # the launcher clones it as uid 10001
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=path, capture_output=True, text=True).stdout.strip()
+
+
+def lay_out(root: Path, port: int, real: dict[str, str] | None = None, *, code: str | None = None) -> dict[str, str]:
+    """Every file and directory the compose file refers to, with fresh secrets.
+
+    ``code`` is the compose project name when the plan is a code worker's task step.
+    """
     names = ("SESSION", "LAUNCHER", "ALERTS", "INFRA", "CODE")
     secret = {name: secrets.token_hex(24) for name in names}
     for sub in (
@@ -151,6 +204,8 @@ def lay_out(root: Path, port: int, real: dict[str, str] | None = None) -> dict[s
         "code",
         "profiles/skills-infra",
         "data/mcp-gate",
+        "repos",
+        "creds/code",
     ):
         (root / sub).mkdir(parents=True, exist_ok=True)
         (root / sub).chmod(0o777)  # the containers run as uid 10001
@@ -197,6 +252,42 @@ def lay_out(root: Path, port: int, real: dict[str, str] | None = None) -> dict[s
             }
         ],
     }
+    if code is not None and real is not None:
+        demo_repo(root / "repos" / "demo")
+        config["workers"].append(
+            {
+                "name": "code",
+                "modes": ["task"],
+                "image": "airlock-investigator:dev",
+                "repos": {"demo": str(root / "repos" / "demo")},
+                "instructions": CODE_RULES,
+                "allowed_permissions": ["repo:commit-local"],
+                "credentials_dir": str(root / "creds" / "code"),
+                # Its only way out is the proxy, like the investigators'.
+                "network": f"{code}_egress",
+                "env": {
+                    "HTTPS_PROXY": "http://egress:8888",
+                    "HTTP_PROXY": "http://egress:8888",
+                    "NO_PROXY": "localhost",
+                },
+                "memory": "2g",
+                "pids": 512,
+                "timeout_seconds": 900,
+            }
+        )
+        model = real["AIRLOCK_MODEL"]
+        engine = {
+            "ANTHROPIC_BASE_URL": real["ANTHROPIC_BASE_URL"],
+            "ANTHROPIC_AUTH_TOKEN": real["ANTHROPIC_AUTH_TOKEN"],
+            "AIRLOCK_MODEL": model,
+            "ANTHROPIC_MODEL": model,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
+            "CLAUDE_CODE_SUBAGENT_MODEL": model,
+        }
+        (root / "creds" / "code" / "engine.env").write_text("".join(f"{k}={v}\n" for k, v in engine.items()))
+        (root / "creds" / "code" / "engine.env").chmod(0o644)  # read by the worker's uid inside its container
     (root / "config.yaml").write_text(json.dumps(config, indent=2))  # JSON is YAML
     (root / "control.env").write_text(
         f"AIRLOCK_SESSION_SECRET={secret['SESSION']}\n"
@@ -207,7 +298,7 @@ def lay_out(root: Path, port: int, real: dict[str, str] | None = None) -> dict[s
         f"AIRLOCK_INVESTIGATOR_CODE_SECRET={secret['CODE']}\n"
     )
     (root / "launcher.env").write_text(f"AIRLOCK_LAUNCHER_SECRET={secret['LAUNCHER']}\n")
-    if real is None:
+    if real is None or code is not None:
         (root / "investigator-infra.env").write_text(
             f"AIRLOCK_SECRET={secret['INFRA']}\nAIRLOCK_ENGINE=stub\nAIRLOCK_STUB_REPLY_FILE=/work/stub-reply.md\n"
         )
@@ -248,7 +339,7 @@ def lay_out(root: Path, port: int, real: dict[str, str] | None = None) -> dict[s
     }
     (root / "mcp-gate.json").write_text(json.dumps(gate))
     (root / "mcp-gate.env").write_text(f"AIRLOCK_MCPGATE_INFRA_TOKEN={secrets.token_hex(24)}\n")
-    (root / "work" / "infra" / "stub-reply.md").write_text(REPLY)
+    (root / "work" / "infra" / "stub-reply.md").write_text(CODE_REPLY if code is not None else REPLY)
     return secret
 
 
@@ -271,13 +362,14 @@ def wait_for(predicate: Any, what: str, within: float = 120) -> Any:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--engine", choices=("stub", "claude"), default="stub")
+    parser.add_argument("--code", action="store_true", help="a code worker changes a made-up repository, real model")
     args = parser.parse_args()
     real = None
-    if args.engine == "claude":
+    if args.engine == "claude" or args.code:
         names = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "AIRLOCK_MODEL")
         missing = [n for n in names if not os.environ.get(n)]
         if missing:
-            raise SystemExit(f"compose smoke: --engine claude needs {', '.join(missing)}")
+            raise SystemExit(f"compose smoke: a real model needs {', '.join(missing)}")
         real = {n: os.environ[n] for n in names}
     gateway = urlparse(real["ANTHROPIC_BASE_URL"]).hostname if real else "api.github.com"
     hide = [v for v in (real or {}).values() if v] + ([gateway] if real else [])
@@ -296,7 +388,7 @@ def main() -> int:
         "AIRLOCK_ROOT": str(root),
         "AIRLOCK_IMAGE": "airlock:dev",
         "AIRLOCK_LAUNCHER_IMAGE": "airlock-launcher:dev",
-        "AIRLOCK_INVESTIGATOR_IMAGE": "airlock-investigator:dev" if real else "airlock:dev",
+        "AIRLOCK_INVESTIGATOR_IMAGE": "airlock-investigator:dev" if real and not args.code else "airlock:dev",
         **({"AIRLOCK_EGRESS_ALLOW": str(gateway)} if real else {}),
         "AIRLOCK_CONSOLE_PORT": str(port),
         "DOCKER_GID": os.environ.get("DOCKER_GID", "0"),
@@ -326,7 +418,7 @@ def main() -> int:
         "airlock-launcher:dev",
         str(ROOT),
     )
-    if real:
+    if real:  # the investigator image also runs task-mode workers
         run(
             "docker",
             "build",
@@ -340,7 +432,7 @@ def main() -> int:
             str(ROOT),
         )
     root.mkdir(parents=True)
-    secret = lay_out(root, port, real)
+    secret = lay_out(root, port, real, code=project if args.code else None)
     results: dict[str, Any] = {}
     try:
         print(f"starting compose project {project}")
@@ -364,7 +456,9 @@ def main() -> int:
             }  # type: ignore[union-attr]
             web.post(f"/work/{work_id}/approve", data=fields)
         final = wait_for(
-            lambda: (s := state_of(db, work_id)) in ("done", "failed", "refused") and s, "the run", within=180
+            lambda: (s := state_of(db, work_id)) in ("done", "failed", "refused") and s,
+            "the run",
+            within=900 if args.code else 180,
         )
         with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
             approval, result = conn.execute(
@@ -416,6 +510,24 @@ def main() -> int:
             results["plan_steps"] = (
                 [" ".join(s.get("argv") or []) for s in json.loads(plan[0])["steps"]] if plan else []
             )
+        if args.code:
+            group = (report.get("groups") or [{}])[0]
+            workspace = group.get("workspace") or {}
+            step = (group.get("steps") or [{}])[0]
+            mirror_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root / "repos" / "demo", capture_output=True, text=True
+            ).stdout.strip()
+            results["code"] = {
+                "step_status": step.get("status"),
+                "tool_calls": step.get("tool_calls"),
+                "files_changed": workspace.get("files"),
+                "insertions": workspace.get("insertions"),
+                "deletions": workspace.get("deletions"),
+                "fix_in_the_diff": "+    return a + b" in (workspace.get("patch") or ""),
+                "test_in_the_diff": "test_calc.py" in (workspace.get("files") or []),
+                "mirror_unchanged": bool(mirror_head) and mirror_head == workspace.get("start"),
+                "worker_said": masked(str(step.get("tail") or "")[-400:]),
+            }
     finally:
         logs = run(*compose, "logs", "--no-color", "--tail", "40", env=env, check=False).stdout
         (ROOT / "data" / f"compose-smoke-{tag}.log").write_text(masked(logs))
@@ -446,6 +558,10 @@ def main() -> int:
         and results.get("record_intact")
         and (real is not None or results.get("worker_output") == "rollout restart deployment/api")
         and (real is None or results.get("model_calls_through_proxy") is True)
+        and (
+            not args.code
+            or all(results.get("code", {}).get(k) for k in ("fix_in_the_diff", "test_in_the_diff", "mirror_unchanged"))
+        )
         and network.get("launcher") == "does not resolve"
         and network.get("internet") == "unreachable"
         and str(network.get("listed", "")).startswith("HTTP/1.1 200")

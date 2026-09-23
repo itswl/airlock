@@ -6,4 +6,9 @@ ARG BASE=airlock:0.1
 FROM docker:29-cli AS docker
 FROM ${BASE}
 COPY --from=docker /usr/local/bin/docker /usr/local/bin/docker
+# git: a worker with `repos` gets a fresh clone per run, and the launcher reads the
+# mirror back to compute what changed (airlock/launcher/workspace.py).
+USER 0
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+USER 10001
 CMD ["python", "-m", "airlock.launcher", "--config", "/etc/airlock/config.yaml", "--host", "0.0.0.0"]

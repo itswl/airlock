@@ -124,8 +124,15 @@ investigators:
 # posture_checks: run before the first step of every group; any failure and
 #   nothing runs. Use them to prove the credential is the dedicated identity.
 # env: non-secret settings only (they are visible in `docker inspect`); secrets
-#   are files in credentials_dir, mounted read-only at /airlock/creds.
+#   are files in credentials_dir, mounted read-only at /airlock/creds. A task-mode
+#   worker's model settings are the file engine.env there (KEY=VALUE lines).
 # network: the Docker network the container joins; none when absent.
+# repos: the repositories a worker may change, name -> a local git repository (a
+#   mirror you keep fetching). Its steps target repo:<name>; every run gets a fresh
+#   clone with no remote, and the launcher computes what changed outside the
+#   container and keeps it with the run. workspace_dir (a fixed directory kept
+#   between runs) is the other answer; a worker has one of the two.
+# instructions: added to every task step's prompt — your rules for this worker.
 workers:
   - name: k8s-ops
     modes: [commands]
@@ -167,16 +174,22 @@ workers:
         argv: [aws, sts, get-caller-identity, --query, Arn, --output, text]
         expect: "user/airlock-aws-ops$"
 
-  - name: repo
+  - name: code
     modes: [task]                             # an agent inside the container, behind the catastrophe floor
-    image: airlock-runner-claude:latest       # FROM the airlock image, plus git and the Claude Code CLI
-    credentials_dir: /opt/airlock/creds/repo  # a token that can push branches, not merge them
-    workspace_dir: /opt/airlock/workspaces/repo
-    network: airlock-egress                   # only the egress proxy's allowlist is reachable
+    image: airlock-investigator:latest        # deploy/Dockerfile.investigator: git and the Claude Code CLI
+    repos:
+      payments-api: /opt/airlock/repos/payments-api   # a mirror; the launcher clones it and never writes it
+    instructions: |
+      Commit every change with a message that says why. There is no remote and nothing to push.
+      When something you need is missing (a toolchain, a credential, an answer), stop and name it.
+    credentials_dir: /opt/airlock/creds/code  # engine.env with ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, AIRLOCK_MODEL
+    network: airlock_egress                   # compose's egress network: only the proxy's allowlist is reachable
     env:
       HTTPS_PROXY: http://egress:8888
       HTTP_PROXY: http://egress:8888
-    allowed_permissions: ["git:push-branch"]
+    allowed_permissions: ["repo:commit-local"]
+    memory: 2g
+    pids: 512
     timeout_seconds: 1800
 
 # ---------------------------------------------------------------- the pipe's outlet

@@ -20,6 +20,10 @@ must keep that true. Before you touch anything, know which side you are on.
 - **Records live outside what they record.** The executor streams; the
   launcher keeps. Do not add a path where a worker container writes the
   authoritative record of its own run.
+- **A workspace stays the worker's after it exits.** The launcher reads a
+  worker's workspace as plain files and never runs git (or anything) in it:
+  its `.git/config` can name programs, and the launcher sits next to the
+  Docker socket. What changed is computed against the mirror, which is trusted.
 - **Tests never touch the outside.** No network beyond loopback, no Docker, no
   model, no credentials, nothing outside pytest's tmp directory. A command a
   test expects to be refused must be harmless if a bug let it run.
@@ -29,9 +33,10 @@ must keep that true. Before you touch anything, know which side you are on.
   server with the Claude engine in its investigator container, the MCP gateway
   in front of a real server (`scripts/mcpgate_check.py` for the protocol), and
   one worker holding a real credential: the forced-command SSH key of
-  `deploy/host/`. Task-mode workers with a real model and cloud identities
-  (AWS, K8s) have not run. A change there is not verified until it has run for
-  real, and a PR says which.
+  `deploy/host/`. A task-mode worker has run a real model in its container
+  and changed a repository (`scripts/compose_smoke.py --code`, on DeepSeek).
+  Cloud identities (AWS, K8s) have not run. A change there is not verified
+  until it has run for real, and a PR says which.
 - **A real model reads nothing it should not send.** Outside a container a real
   engine runs confined, in a working directory outside every repository, with
   a curated environment. What a tool reads is sent to the model provider.

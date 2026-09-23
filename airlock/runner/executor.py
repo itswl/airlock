@@ -126,10 +126,23 @@ async def run_command(
 
 
 def task_prompt(step: Mapping[str, Any], spec: Mapping[str, Any]) -> str:
+    workspace = (
+        f"The repository {spec['workspace_repo']} is checked out in your working directory: a fresh clone made "
+        "for this run, with no remote. Commit your changes there; what changed is taken from it after you finish, "
+        "so there is nothing to push and nothing to paste.\n\n"
+        if spec.get("workspace_repo")
+        else ""
+    )
+    rules = (
+        f"Rules for this worker, from its operator:\n{spec['instructions'].strip()}\n\n"
+        if spec.get("instructions")
+        else ""
+    )
     return (
         f"You are carrying out one approved step of plan {spec.get('plan_hash', '')[:12]} "
         f"as worker {spec.get('worker')}.\n\nTarget: {step.get('target')}\nWhy: {step.get('why', '')}\n"
         f"Permissions granted for this plan: {', '.join(spec.get('permissions') or []) or 'none listed'}\n\n"
+        f"{workspace}{rules}"
         f"The step:\n```text\n{step.get('task', '')}\n```\n\n"
         "Do exactly this step on exactly this target and nothing else. If it cannot be done as written, "
         "stop and say why instead of improvising. End with what you did and how you checked it."
@@ -228,7 +241,7 @@ async def run_group(
         elif "task" not in modes:
             outcome = _refused(recorder, step, "this worker does not run task steps")
         else:
-            engine = (engine_factory or default_engine)()
+            engine = engine_factory() if engine_factory else default_engine(spec)
             outcome = await run_task(step, spec, recorder, cwd=cwd, engine=engine)
         outcomes.append(outcome)
         if outcome["status"] != "done":
@@ -248,12 +261,38 @@ def _stub_task(request: EngineRequest) -> StubTurn:
     )
 
 
-def default_engine() -> Engine:
+ENGINE_ENV = "engine.env"
+
+
+def engine_env(credentials: str | None) -> dict[str, str]:
+    """The model settings a task-mode worker keeps with its own credentials: ``engine.env``, KEY=VALUE lines.
+
+    In the worker's credentials directory because that is where everything
+    this worker holds already lives, one directory per profile, mounted read-only.
+    """
+    if not credentials:
+        return {}
+    path = Path(credentials) / ENGINE_ENV
+    if not path.is_file():
+        return {}
+    found: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        found[key.strip()] = value.strip().strip("'\"")
+    return found
+
+
+def default_engine(spec: Mapping[str, Any] | None = None) -> Engine:
     if os.environ.get("AIRLOCK_ENGINE", "claude") == "stub":
         return StubEngine(_stub_task, execute_bash=True)
     from airlock.runner.claude_engine import ClaudeEngine
 
-    return ClaudeEngine(model=os.environ.get("AIRLOCK_MODEL") or None)
+    env = engine_env(str((spec or {}).get("credentials") or "") or None)
+    model = env.get("AIRLOCK_MODEL") or os.environ.get("AIRLOCK_MODEL") or None
+    return ClaudeEngine(model=model, env=env)
 
 
 def main() -> int:

@@ -71,7 +71,8 @@ def test_the_shipped_example_loads(env: dict[str, str]) -> None:
     values = {name: "x" * 32 for name in names} | {"AIRLOCK_OPERATOR_PASSWORD_HASH": env["T_PASSWORD_HASH"]}
     control = load_control(example, values)
     launcher = load_launcher(example, values)
-    assert set(control.workers) == set(launcher.workers) == {"k8s-ops", "aws-ops", "repo"}
+    assert set(control.workers) == set(launcher.workers) == {"k8s-ops", "aws-ops", "code"}
+    assert set(launcher.workers["code"].repos) == {"payments-api"} and launcher.workers["code"].instructions
     assert control.sources["jira"].event_header is None and control.routes[-1].when is None
     assert control.workers["k8s-ops"].allows_command("kubectl -n payments rollout restart deployment/api")
     assert not control.workers["k8s-ops"].allows_command("kubectl -n kube-system rollout restart deployment/api")

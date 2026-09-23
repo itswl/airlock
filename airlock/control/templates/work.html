@@ -109,6 +109,14 @@
       <td>{% if g.record_intact %}<span class="ok">完整</span>{% else %}<span class="bad">不完整</span>{% endif %} <code class="small">{{ (g.record_head or "")[:16] }}</code></td></tr>
     {% endfor %}
   </table>
+  {% for g in run.result.groups or [] %}{% if g.workspace %}
+  <h3>第 {{ loop.index }} 组改了什么：{{ g.workspace.repo }}</h3>
+  {% if g.workspace.error %}<p class="bad">没能算出改动：{{ g.workspace.error }}</p>{% else %}
+  <p class="small">从 <code>{{ (g.workspace.start or "")[:12] }}</code> 起，{{ g.workspace.files_changed }} 个文件，+{{ g.workspace.insertions }} −{{ g.workspace.deletions }}；diff 的 sha256 <code>{{ (g.workspace.patch_sha256 or "")[:16] }}</code>。由启动器在容器外算出，不是工作画像自己报的。
+    {% for note in g.workspace.notes or [] %}<br><span class="muted">{{ note }}</span>{% endfor %}</p>
+  {% if g.workspace.files_changed %}<details><summary>diff{% if g.workspace.patch_in_report_truncated %}（太长，这里只显示开头，完整的在启动器的运行目录里）{% endif %}</summary><pre>{{ g.workspace.patch }}</pre></details>{% endif %}
+  {% endif %}
+  {% endif %}{% endfor %}
 </div>
 {% endfor %}
 

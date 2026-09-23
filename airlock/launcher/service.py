@@ -37,11 +37,15 @@ from airlock.control.service import Outcome
 from airlock.crypto import canonical_json, sign
 from airlock.db import Database
 from airlock.launcher.runtime import GroupSpec, Runtime
+from airlock.launcher.workspace import Prepared, WorkspaceError, changes, prepare, repo_of
 from airlock.plans import PlanError, groups, parse_plan, plan_hash, targets, validate_plan
 from airlock.runner.executor import AUDIT_PREFIX, RESULT_PREFIX
 from airlock.runner.recorder import Recorder, verify_lines
 
 logger = logging.getLogger("airlock.launcher")
+
+# How much of a run's diff travels in the report; the whole of it stays in the run directory.
+REPORT_PATCH_CHARS = 200_000
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS launches (
@@ -268,12 +272,37 @@ class Launcher:
         status, reason = "done", ""
         progress: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         sender = asyncio.create_task(self._send_progress(progress))
+        workspaces: dict[tuple[str, str], Prepared] = {}
         try:
             for index, group in enumerate(groups(plan), start=1):
                 if approval_id in self.cancelled:
                     status, reason = "cancelled", "stopped by the operator"
                     break
                 worker = self.config.workers[group["worker"]]
+                workspace: Prepared | None = None
+                if worker.repos:
+                    repo = repo_of(str(group.get("repo") or "")) or ""
+                    key = (worker.name, repo)
+                    if key not in workspaces:
+                        try:
+                            workspaces[key] = await asyncio.to_thread(
+                                prepare, repo, Path(worker.repos[repo]), run_dir / f"workspace-{worker.name}-{repo}"
+                            )
+                        except (WorkspaceError, KeyError, OSError) as exc:
+                            status, reason = "failed", f"group {index}: the workspace could not be prepared: {exc}"
+                            record.write("workspace.failed", group=index, worker=worker.name, repo=repo, reason=reason)
+                            outcomes.append({"group": index, "worker": worker.name, "status": status, "reason": reason})
+                            break
+                        prepared = workspaces[key]
+                        record.write(
+                            "workspace.prepared",
+                            group=index,
+                            worker=worker.name,
+                            repo=repo,
+                            source=str(prepared.source),
+                            start=prepared.start,
+                        )
+                    workspace = workspaces[key]
                 spec = GroupSpec(
                     approval_id=approval_id,
                     work_id=str(approval.get("work_id") or ""),
@@ -284,8 +313,13 @@ class Launcher:
                     permissions=list(plan.permissions.get(group["worker"]) or []),
                     out_dir=run_dir / f"group-{index}",
                     engine=self.engine,
+                    workspace=workspace.path if workspace else None,
                 )
                 outcome = await self._run_group(approval, spec, record, progress)
+                if workspace is not None:
+                    outcome["workspace"] = await self._changes(
+                        workspace, run_dir / f"group-{index}.patch", index, record
+                    )
                 outcomes.append(outcome)
                 if outcome["status"] != "done":
                     status, reason = outcome["status"], outcome["reason"]
@@ -320,6 +354,19 @@ class Launcher:
         )
         await self._report(approval_id, report)
         self.tasks.pop(approval_id, None)
+
+    async def _changes(self, workspace: Prepared, patch_path: Path, group: int, record: Recorder) -> dict[str, Any]:
+        """What the group changed in its repository, computed here and kept here (see airlock.launcher.workspace)."""
+        try:
+            found = await asyncio.to_thread(changes, workspace, patch_path)
+        except (WorkspaceError, OSError) as exc:
+            found = {"repo": workspace.repo, "start": workspace.start, "error": f"{type(exc).__name__}: {exc}"[:500]}
+        record.write("workspace.changes", group=group, **{k: v for k, v in found.items() if k != "files"})
+        if "patch_path" in found:
+            text = patch_path.read_text(encoding="utf-8", errors="replace")
+            found["patch"] = text[:REPORT_PATCH_CHARS]
+            found["patch_in_report_truncated"] = len(text) > REPORT_PATCH_CHARS
+        return found
 
     async def _report(self, approval_id: str, report: Mapping[str, Any]) -> bool:
         try:
