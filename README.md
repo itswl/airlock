@@ -112,9 +112,23 @@ export ANTHROPIC_BASE_URL=…  ANTHROPIC_AUTH_TOKEN=…  AIRLOCK_MODEL=…   # �
 .venv/bin/python scripts/demo.py --engine claude
 ```
 
-两个调查员换成真的 Claude 引擎，读的是一套编造的故障证据（日志、指标、runbook；部署历史只在 code 那边，infra 要去会诊）。它们在本机跑，所以是**受限模式**（`AIRLOCK_CONFINE=1`，见 `airlock/runner/sandbox.py`）：工作目录是仓库外新建的临时目录，工具只能碰这个目录，shell 只剩几条只读命令，其他一律拒绝并记录。别在限制模式之外、容器之外用真模型：它读到的东西都会作为工具输出发给模型网关。
+两个调查员换成真的 Claude 引擎，读的是一套编造的故障证据：infra 看日志和指标，runbook 是一个 skill；code 的部署历史来自一个演示用的 MCP 服务器（`scripts/demo_mcp.py`），infra 要去会诊它。它们在本机跑，所以是**受限模式**（`AIRLOCK_CONFINE=1`，见 `airlock/runner/sandbox.py`）：工作目录是仓库外新建的临时目录，工具只能碰这个目录，shell 只剩几条只读命令，其他一律拒绝并记录。别在限制模式之外、容器之外用真模型：它读到的东西都会作为工具输出发给模型网关。
 
 CLI 报的 `cost_usd` 是它按自己的价目表估的，续接的会话里还会累加；每一轮的真实用量看账本里的 `usage`（token 数）。
+
+## 调查员的 MCP 和 skills
+
+每个调查节点用环境变量配（和 hookprobe 的做法一样）：
+
+- `AIRLOCK_MCP_CONFIG`：MCP 服务器清单，`.mcp.json` 的格式（`{"mcpServers": {...}}`）。**每次运行重新读**，改了下一次就生效；CLI 只认这一份（strict），别处的设置加不了服务器。文件要放在工作目录外，或者工作目录的 `.claude/` 下，调查员写不了的地方，否则节点拒绝启动。
+- `AIRLOCK_MCP_ALLOWED`：调查员能调的 MCP 工具，逐个列出（`mcp__<服务器>__<工具>`，或者 `mcp__<服务器>__*`）。挂上服务器不等于给了它的工具，没列的一律拒绝并记录。
+- `AIRLOCK_SKILLS`：`all` 或名单。skills 放在 `工作目录/.claude/skills/<名字>/SKILL.md`，由你只读挂载。打开 skills 后，CLI 也会读工作目录的 `.claude/settings.json` 和 `CLAUDE.md`，这些调查员同样改不了。
+
+- `AIRLOCK_STATE_DIR`：节点自己的会话和每个工作项的记录。守卫不让调查员读它（否则一个工作项的调查能翻到别的工作项的记录）；最好放在工作目录外，眼不见为净。
+
+真 CLI 验证过（2026-09-23）：放行的 MCP 工具能调通；没放行的被闸门拦下，服务器那边根本没执行；skill 被加载，并且模型照着它做了。
+
+**边界**：MCP 服务器能碰到什么，取决于它的凭证；调查员和它在同一个容器里、同一个用户，那些凭证调查员也读得到。所以给调查员的 MCP 服务器也只能配只读凭证，工具放行名单是第二道防线，不是边界。
 
 ## 部署
 
@@ -145,6 +159,8 @@ CLI 报的 `cost_usd` 是它按自己的价目表估的，续接的会话里还�
 - Docker 运行时：`docker run` 的参数有测试，但没有在 Docker 上跑过一个真容器。
 - 容器里的调查员和 task 模式的工作画像（真模型只在本机受限模式下跑过）。
 - `deploy/` 下的镜像和编排。
+
+MCP 和 skills 已实现并在真 CLI 上验证（见上文）。
 
 还**没有做**的：
 

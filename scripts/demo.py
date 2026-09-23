@@ -121,31 +121,37 @@ EVIDENCE = {
             "09:00-09:10    0.2%      180     21%     34/200\n"
             "09:12-09:40    7.1%      4200    22%     30/200\n"
         ),
-        "runbook.md": (
-            "# demo/api runbook\n\n"
-            "Restart: in production `kubectl -n demo rollout restart deployment/api`.\n"
+        # The runbook is a skill: the investigator loads it when the logs say "pool exhausted".
+        ".claude/skills/pool-exhaustion/SKILL.md": (
+            "---\n"
+            "name: pool-exhaustion\n"
+            'description: How to investigate and fix connection-pool exhaustion on demo/api. Use when logs say "pool exhausted".\n'
+            "---\n"
+            "# Pool exhaustion on demo/api\n\n"
+            "1. Compare the pool limit in the errors with the database's own connection usage.\n"
+            "2. A recent change to the pool size is the usual cause: ask the code investigator for the deploy history.\n"
+            "3. A restart alone recreates the same pool; the fix restores the limit.\n\n"
             "In this demo the ops worker simulates every action with echo, one line per action:\n"
-            "  echo rollout restart deployment/api\n"
             "  echo drain deployment/api\n"
             "  echo set max_connections=20 deployment/api\n"
+            "  echo rollout restart deployment/api\n"
         ),
     },
     "code": {
-        "deploys.log": (
-            "2026-09-22T16:40Z api v2.13.2 deployed by ci (no config change)\n"
-            "2026-09-23T09:10Z api v2.14.0 deployed by ci: config/pool.yaml max_connections 20 -> 10 "
-            "(commit 3f2a9c1 'tune pool for smaller db')\n"
-        ),
+        # The deploy history is not a file here: it comes from the demo MCP server.
         "config/pool.yaml": "max_connections: 10   # 20 before v2.14.0\nacquire_timeout_ms: 5000\n",
     },
 }
 INSTRUCTIONS = {
     "infra": (
-        "Demo. You look at demo/api through the files in your working directory: logs, metrics and a runbook. "
+        "Demo. You look at demo/api through the files in your working directory (logs, metrics) and your skills. "
         "You do NOT have the deploy history or the configuration; the code investigator does. Ask it with the "
         "consult tool when a change in code or configuration could explain what you see."
     ),
-    "code": "Demo. You hold demo/api's deploy history and configuration in your working directory. Answer from them.",
+    "code": (
+        "Demo. demo/api's configuration is in your working directory; its deploy history comes from the demo MCP "
+        "server's deploy_history tool. Answer from those."
+    ),
 }
 
 
@@ -228,7 +234,9 @@ async def send_alert(control_url: str, secret: str) -> str:
     return str(response.json()["work_id"])
 
 
-async def smoke(control_url: str, plane: ControlPlane, work_id: str, *, real: bool = False) -> None:
+async def smoke(
+    control_url: str, plane: ControlPlane, work_id: str, *, real: bool = False, scratch: Path | None = None
+) -> None:
     """Do what a person would: wait for the plan, ask for a revision, approve it, wait for the record."""
     patience = 900.0 if real else 30.0
 
@@ -268,6 +276,8 @@ async def smoke(control_url: str, plane: ControlPlane, work_id: str, *, real: bo
     print(f"smoke: {final}, plan v{version}, steps {steps}, ledger intact: {plane.ledger.verify()['intact']}")
     if real:
         report(plane, work_id)
+        if scratch is not None:
+            tool_use(scratch)
     if final != "done" or (not real and len(steps) != 3):
         raise SystemExit(1)
 
@@ -295,14 +305,41 @@ def report(plane: ControlPlane, work_id: str) -> None:
         )
 
 
-def engine_for(name: str, kind: str) -> Engine:
+def tool_use(scratch: Path) -> None:
+    """Which tools each investigator called or was refused, from its own record."""
+    for name in ("infra", "code"):
+        seen: dict[str, int] = {}
+        for record in sorted((scratch / f"{name}.state" / "records").glob("*.jsonl")):
+            for raw in record.read_text(encoding="utf-8").splitlines():
+                line = json.loads(raw)
+                if line["kind"] in ("tool.call", "tool.refused"):
+                    label = f"{line['data'].get('tool')}{' (refused)' if line['kind'] == 'tool.refused' else ''}"
+                    seen[label] = seen.get(label, 0) + 1
+        print(f"tools {name}: " + ", ".join(f"{k} x{v}" for k, v in sorted(seen.items())))
+
+
+def engine_for(name: str, kind: str, mcp_config: Path | None = None) -> Engine:
     if kind == "stub":
         return StubEngine(infra if name == "infra" else code)
     from airlock.runner.claude_engine import ClaudeEngine
     from airlock.runner.sandbox import CONFINED_TOOLS
 
     budget = float(os.environ.get("AIRLOCK_MAX_BUDGET_USD") or 1.0)
-    return ClaudeEngine(model=os.environ.get("AIRLOCK_MODEL") or None, tools=CONFINED_TOOLS, max_budget_usd=budget)
+    return ClaudeEngine(
+        model=os.environ.get("AIRLOCK_MODEL") or None,
+        tools=CONFINED_TOOLS,
+        max_budget_usd=budget,
+        mcp_config=mcp_config,
+        skills="all" if name == "infra" else None,
+    )
+
+
+def mcp_config_for(scratch: Path) -> Path:
+    """The code investigator's MCP servers: the demo one. Outside its working directory, as a real one must be."""
+    path = scratch / "code.mcp.json"
+    server = {"command": sys.executable, "args": [str(ROOT / "scripts" / "demo_mcp.py")]}
+    path.write_text(json.dumps({"mcpServers": {"demo": server}}), encoding="utf-8")
+    return path
 
 
 async def main() -> int:
@@ -326,8 +363,10 @@ async def main() -> int:
     scratch = Path(tempfile.mkdtemp(prefix="airlock-demo-")) if real else data
     for name in ("infra", "code"):
         workdir = scratch / name
+        mcp_config = None
         if real:
             seed(workdir, EVIDENCE[name])
+            mcp_config = mcp_config_for(scratch) if name == "code" else None
         settings = NodeConfig(
             profile=name,
             secret=env[name.upper()],
@@ -338,8 +377,10 @@ async def main() -> int:
             confine=real,
             max_turns=25,
             timeout_seconds=600,
+            mcp_allowed=frozenset({"mcp__demo__deploy_history"}) if mcp_config else frozenset(),
+            state_dir=scratch / f"{name}.state" if real else None,
         )
-        apps[name] = create_node_app(InvestigatorNode(settings, engine_for(name, args.engine)))
+        apps[name] = create_node_app(InvestigatorNode(settings, engine_for(name, args.engine, mcp_config)))
     launcher = Launcher(load_launcher(config, env), LocalRuntime(), engine="stub")
     apps["launcher"] = create_launcher_app(launcher, tick_seconds=2)
 
@@ -354,7 +395,7 @@ async def main() -> int:
         print(f"investigators work in {scratch}")
     if args.smoke:
         try:
-            await smoke(control_url, plane, work_id, real=real)
+            await smoke(control_url, plane, work_id, real=real, scratch=scratch if real else None)
         finally:
             for server in servers.values():
                 server.should_exit = True

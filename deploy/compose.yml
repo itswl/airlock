@@ -52,8 +52,12 @@ services:
       AIRLOCK_PROFILE: infra
       AIRLOCK_CONTROL_URL: http://control:8080
       AIRLOCK_WORKDIR: /work
+      AIRLOCK_STATE_DIR: /state                                  # sessions and records, out of the agent's sight
       AIRLOCK_INSTRUCTIONS_FILE: /etc/airlock/infra.md
       AIRLOCK_POSTURE_FILE: /etc/airlock/posture-infra.yaml
+      AIRLOCK_MCP_CONFIG: /etc/airlock/mcp-infra.json            # read-only credentials only, like everything here
+      AIRLOCK_MCP_ALLOWED: mcp__grafana__query,mcp__grafana__list_dashboards
+      AIRLOCK_SKILLS: all
       HTTPS_PROXY: http://egress:8888
       HTTP_PROXY: http://egress:8888
       NO_PROXY: control
@@ -63,8 +67,11 @@ services:
     volumes:
       - ./profiles/infra.md:/etc/airlock/infra.md:ro
       - ./profiles/posture-infra.yaml:/etc/airlock/posture-infra.yaml:ro
+      - ./profiles/mcp-infra.json:/etc/airlock/mcp-infra.json:ro
+      - ./profiles/skills-infra:/work/.claude/skills:ro          # SKILL.md files, one directory per skill
       - /opt/airlock/creds/investigator-infra:/creds:ro   # READ-ONLY identities only
       - /opt/airlock/work/infra:/work
+      - /opt/airlock/state/infra:/state
     read_only: true
     tmpfs: [/tmp]
     cap_drop: [ALL]
@@ -79,6 +86,7 @@ services:
       AIRLOCK_PROFILE: code
       AIRLOCK_CONTROL_URL: http://control:8080
       AIRLOCK_WORKDIR: /work
+      AIRLOCK_STATE_DIR: /state
       HTTPS_PROXY: http://egress:8888
       HTTP_PROXY: http://egress:8888
       NO_PROXY: control
@@ -86,6 +94,7 @@ services:
     volumes:
       - /opt/airlock/code:/work/code:ro   # the repositories it reads; the :ro is the boundary
       - /opt/airlock/work/code:/work
+      - /opt/airlock/state/code:/state
     read_only: true
     tmpfs: [/tmp]
     cap_drop: [ALL]

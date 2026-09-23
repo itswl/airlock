@@ -99,7 +99,9 @@ routes:
 #
 # Each profile is its own container (python -m airlock.runner.investigator) with
 # only its own read-only credentials. It reaches the control plane and nothing
-# else it was not given; the control plane reaches it at `url`.
+# else it was not given; the control plane reaches it at `url`. Its MCP servers
+# and skills are set on the node itself: AIRLOCK_MCP_CONFIG, AIRLOCK_MCP_ALLOWED,
+# AIRLOCK_SKILLS (see airlock/runner/investigator.py and airlock/runner/mcp.py).
 investigators:
   - name: infra
     url: http://investigator-infra:8100

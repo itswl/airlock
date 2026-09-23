@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from airlock.crypto import sha256_hex
-from airlock.runner.gate import deny_reason, redact
+from airlock.runner.gate import deny_reason, private_reason, redact
 from airlock.runner.sandbox import CONSULT_TOOL, confine_reason
 
 __all__ = ["CONSULT_TOOL", "Engine", "EngineRequest", "EngineResult", "StubEngine", "StubTurn", "ToolPolicy"]
@@ -77,6 +77,7 @@ class ToolPolicy:
         mcp_allowed: frozenset[str] = frozenset(),
         record: Record | None = None,
         confine: bool = False,
+        private: tuple[Path, ...] = (),
     ) -> None:
         if confine and workdir is None:
             raise ValueError("a confined policy needs the working directory it confines to")
@@ -85,6 +86,7 @@ class ToolPolicy:
         self.mcp_allowed = mcp_allowed
         self.record = record
         self.confine = confine
+        self.private = private
         self.refusals = 0
         self.calls = 0
 
@@ -99,6 +101,10 @@ class ToolPolicy:
             reason = confine_reason(tool, data, self.workdir)
             if reason is not None:
                 decision = ("sandbox", f"sandbox: {reason}")
+        if decision is None:
+            reason = private_reason(tool, data, self.private, self.workdir)
+            if reason is not None:
+                decision = ("private", reason)
         if decision is None:
             decision = deny_reason(tool, data, mode=self.mode, workdir=self.workdir, mcp_allowed=self.mcp_allowed)
         detail, _ = redact(tool_detail(tool_input))

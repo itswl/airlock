@@ -113,6 +113,41 @@ def deny_reason(
     return None
 
 
+def private_reason(tool_name: str, tool_input: Any, private: tuple[Path, ...], workdir: Path | None) -> str | None:
+    """A tool call that would read or write the node's own state: its sessions and every work item's record.
+
+    Not a credential boundary — the same investigator made those records. It is
+    what keeps one work item's investigation from reading another's, so that
+    "different alerts never share a session" holds for the files too.
+    """
+    if not private:
+        return None
+    data = tool_input if isinstance(tool_input, dict) else {}
+    roots = [_resolve(p) for p in private]
+    if tool_name == "Bash":
+        command = str(data.get("command") or "")
+        for root in roots:
+            names = {str(root)}
+            if workdir is not None and _resolve(workdir) in root.parents:
+                names.add(str(root.relative_to(_resolve(workdir))))
+            if any(name in command for name in names):
+                return "this node's own state and records are not for the agent"
+        return None
+    for key in ("file_path", "path", "notebook_path", "pattern"):
+        raw = str(data.get(key) or "")
+        if not raw:
+            continue
+        candidate = Path(raw.split("*", 1)[0] or ".") if key == "pattern" else Path(raw)
+        if not candidate.is_absolute():
+            if workdir is None:
+                continue
+            candidate = workdir / candidate
+        target = _resolve(candidate)
+        if any(target == root or root in target.parents for root in roots):
+            return "this node's own state and records are not for the agent"
+    return None
+
+
 # Shapes that are issued credentials and nothing else. Narrow on purpose: a
 # guard that fires on the word "password" is a guard people learn to ignore.
 SECRET_SHAPES: tuple[tuple[str, re.Pattern[str]], ...] = (

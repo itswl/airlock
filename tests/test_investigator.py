@@ -259,3 +259,37 @@ def test_the_prompt_says_when_this_is_the_same_signal_again() -> None:
     assert "arrived 3 times" in prompt
     assert "Starting over" in investigation_prompt(payload(session={"mode": "fresh"}))
     assert "Starting over" not in prompt
+
+
+def test_the_nodes_own_state_is_not_for_the_agent(tmp_path: Path) -> None:
+    from airlock.runner.engine import ToolPolicy
+
+    state = tmp_path / ".airlock"
+    (state / "records").mkdir(parents=True)
+    policy = ToolPolicy(READONLY, tmp_path, private=(state,))
+    for tool, data in [
+        ("Read", {"file_path": str(state / "records" / "w1.jsonl")}),
+        ("Read", {"file_path": ".airlock/sessions.json"}),
+        ("Glob", {"pattern": ".airlock/**/*.jsonl"}),
+        ("Grep", {"pattern": "pool", "path": str(state)}),
+        ("Bash", {"command": "cat .airlock/records/w1.jsonl"}),
+        ("Bash", {"command": f"grep -r pool {state}"}),
+    ]:
+        refused = policy.before(tool, data)
+        assert refused is not None and "not for the agent" in refused, (tool, data)
+    assert policy.before("Read", {"file_path": str(tmp_path / "logs" / "api.log")}) is None
+    assert policy.before("Bash", {"command": "grep -r pool logs"}) is None
+
+
+async def test_state_can_live_outside_the_working_directory(tmp_path: Path) -> None:
+    work, state = tmp_path / "work", tmp_path / "state"
+    investigator, _, _ = node(
+        work,
+        lambda r: StubTurn(tools=[("Read", {"file_path": str(state / "sessions.json")})], text="ok"),
+        state_dir=state,
+    )
+    investigator.accept(payload())
+    await investigator.drain()
+    assert (state / "records" / "w1.jsonl").exists() and not (work / ".airlock").exists()
+    lines = read_lines(state / "records" / "w1.jsonl")
+    assert lines[0]["kind"] == "tool.refused" and lines[0]["data"]["guard"] == "private"

@@ -41,7 +41,9 @@ FILE_TOOLS: dict[str, tuple[str, ...]] = {
     "LS": ("path",),
 }
 CONFINED_TOOLS = ("Bash", "Read", "Write", "Edit", "Glob", "Grep", "TodoWrite")
-ALLOWED = frozenset({*FILE_TOOLS, "Bash", "TodoWrite", CONSULT_TOOL})
+# Skill loads instructions the operator put in .claude/skills; it reads nothing
+# else. MCP tools are not listed: the MCP allowlist in the gate decides them.
+ALLOWED = frozenset({*FILE_TOOLS, "Bash", "TodoWrite", "Skill", CONSULT_TOOL})
 
 # Commands that only read. sed, awk, xargs, tee and every interpreter are
 # absent: each can write files or run other programs from inside its argument.
@@ -202,6 +204,8 @@ def shell_reason(command: str, root: Path) -> str | None:
 
 def confine_reason(tool: str, tool_input: Mapping[str, Any], root: Path) -> str | None:
     """Why this call may not run on a confined node, or None."""
+    if tool.startswith("mcp__"):
+        return None
     if tool not in ALLOWED:
         return f"{tool} is not available to an investigator running outside a container"
     if tool in FILE_TOOLS:

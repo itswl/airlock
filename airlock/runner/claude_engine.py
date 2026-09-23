@@ -20,10 +20,12 @@ import json
 import logging
 import os
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 from airlock.runner.engine import CONSULT_TOOL, EngineRequest, EngineResult, ToolPolicy
 from airlock.runner.gate import refusal
+from airlock.runner.mcp import McpConfigError, load_mcp_servers
 
 logger = logging.getLogger("airlock.claude")
 
@@ -64,7 +66,14 @@ def _response_text(response: Any) -> tuple[str, bool]:
 
 
 class ClaudeEngine:
-    """``tools`` is the built-in toolset the model is shown at all; the policy still decides each call."""
+    """``tools`` is the built-in toolset the model is shown at all; the policy still decides each call.
+
+    ``mcp_config`` names the MCP servers file (airlock.runner.mcp), read at the
+    start of every run. ``skills`` is ``"all"`` or a list of names: skills load
+    from the working directory's ``.claude/skills``, and with them the CLI reads
+    that directory's project settings (``.claude/settings.json``, ``CLAUDE.md``),
+    which the gate keeps the agent from writing.
+    """
 
     def __init__(
         self,
@@ -73,11 +82,18 @@ class ClaudeEngine:
         tools: Sequence[str] = BUILTIN_TOOLS,
         env: Mapping[str, str] | None = None,
         max_budget_usd: float | None = None,
+        mcp_config: Path | None = None,
+        skills: str | Sequence[str] | None = None,
     ) -> None:
         self.model = model
         self.tools = tuple(tools)
         self.env = dict(env or {})
         self.max_budget_usd = max_budget_usd
+        self.mcp_config = mcp_config
+        if isinstance(skills, str):
+            self.skills: str | list[str] | None = "all" if skills == "all" else [skills]
+        else:
+            self.skills = list(skills) if skills else None
 
     def cli_env(self) -> dict[str, str]:
         return {**CLI_DEFAULTS, **withheld(os.environ), **self.env}
@@ -108,8 +124,12 @@ class ClaudeEngine:
             )
             return {}
 
-        mcp_servers: dict[str, Any] = {}
-        allowed = [*self.tools, *sorted(request.mcp_allowed)]
+        try:
+            mcp_servers: dict[str, Any] = dict(load_mcp_servers(self.mcp_config)) if self.mcp_config else {}
+        except McpConfigError as exc:
+            return EngineResult(text="", error=f"MCP configuration: {exc}")
+        tools = [*self.tools, *(["Skill"] if self.skills and "Skill" not in self.tools else [])]
+        allowed = [*tools, *sorted(request.mcp_allowed)]
         if request.consult is not None and request.consultable:
             ask = request.consult
 
@@ -131,16 +151,19 @@ class ClaudeEngine:
             cwd=str(request.workdir),
             model=self.model,
             permission_mode="bypassPermissions",
-            tools=list(self.tools),
+            tools=tools,
             allowed_tools=allowed,
+            # These servers and no others: nothing in a settings file adds one.
+            strict_mcp_config=True,
+            skills=self.skills,
             env=self.cli_env(),
             max_budget_usd=self.max_budget_usd,
             stderr=stderr_tail.append,
             max_turns=request.max_turns,
             system_prompt={"type": "preset", "preset": "claude_code", "append": request.system},
-            # Nothing from the user's or the project's settings: what steers a run
-            # is this request, not a file somebody left in the workdir.
-            setting_sources=[],
+            # Nothing from the user's settings, ever. The project's (the working
+            # directory's) only when skills are on, because that is where they live.
+            setting_sources=["project"] if self.skills else [],
             mcp_servers=mcp_servers,
             hooks={
                 "PreToolUse": [HookMatcher(matcher=None, hooks=[pre_tool])],

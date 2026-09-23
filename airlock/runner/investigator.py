@@ -22,9 +22,15 @@ Configuration is the environment, because a node is a container:
     AIRLOCK_CONTROL_URL        where the control plane is
     AIRLOCK_ENGINE             claude (default) or stub
     AIRLOCK_WORKDIR            the agent's working directory (default /work)
+    AIRLOCK_STATE_DIR          this node's sessions and records (default <workdir>/.airlock); keep it
+                               outside the working directory — the agent can read neither way, but outside
+                               is out of sight too
     AIRLOCK_INSTRUCTIONS_FILE  this profile's own instructions: what it looks at and how
     AIRLOCK_POSTURE_FILE       YAML list of posture checks (see airlock.runner.posture)
-    AIRLOCK_MCP_ALLOWED        comma-separated MCP tools this profile may call
+    AIRLOCK_MCP_CONFIG         JSON file of MCP servers ({"mcpServers": {...}}), read at the start of every run;
+                               outside the working directory, or under its .claude/ (see airlock.runner.mcp)
+    AIRLOCK_MCP_ALLOWED        comma-separated MCP tools this profile may call: mcp__<server>__<tool> or mcp__<server>__*
+    AIRLOCK_SKILLS             "all" or comma-separated names; skills live in <workdir>/.claude/skills
     AIRLOCK_MAX_CONCURRENT     investigations at once (default 2)
     AIRLOCK_MODEL              model name for the claude engine
     AIRLOCK_MAX_BUDGET_USD     per-turn spending cap the claude engine enforces
@@ -55,6 +61,7 @@ from airlock import __version__
 from airlock.crypto import PROFILE_HEADER, SignatureError, canonical_json, sign, verify
 from airlock.runner.engine import CONSULT_TOOL, Engine, EngineRequest, StubEngine, StubTurn, ToolPolicy
 from airlock.runner.guard import READONLY
+from airlock.runner.mcp import McpConfigError, load_mcp_servers, safe_location
 from airlock.runner.posture import passed, run_checks
 from airlock.runner.recorder import Recorder
 
@@ -103,6 +110,9 @@ class NodeConfig:
     model: str | None = None
     max_budget_usd: float | None = None
     confine: bool = False
+    mcp_config: Path | None = None
+    skills: tuple[str, ...] = ()
+    state_dir: Path | None = None
 
 
 def load_node(env: Mapping[str, str] | None = None) -> NodeConfig:
@@ -116,12 +126,16 @@ def load_node(env: Mapping[str, str] | None = None) -> NodeConfig:
     checks: tuple[Mapping[str, Any], ...] = ()
     if env.get("AIRLOCK_POSTURE_FILE"):
         checks = tuple(yaml.safe_load(Path(env["AIRLOCK_POSTURE_FILE"]).read_text(encoding="utf-8")) or ())
+    workdir = Path(env.get("AIRLOCK_WORKDIR", "/work"))
+    mcp_config = Path(env["AIRLOCK_MCP_CONFIG"]) if env.get("AIRLOCK_MCP_CONFIG") else None
+    if mcp_config is not None:
+        check_mcp_config(mcp_config, workdir)
     return NodeConfig(
         profile=env["AIRLOCK_PROFILE"],
         secret=env["AIRLOCK_SECRET"],
         control_url=env["AIRLOCK_CONTROL_URL"].rstrip("/"),
         engine=env.get("AIRLOCK_ENGINE", "claude"),
-        workdir=Path(env.get("AIRLOCK_WORKDIR", "/work")),
+        workdir=workdir,
         instructions=instructions,
         posture_checks=checks,
         mcp_allowed=frozenset(t.strip() for t in env.get("AIRLOCK_MCP_ALLOWED", "").split(",") if t.strip()),
@@ -131,7 +145,23 @@ def load_node(env: Mapping[str, str] | None = None) -> NodeConfig:
         model=env.get("AIRLOCK_MODEL") or None,
         max_budget_usd=float(env["AIRLOCK_MAX_BUDGET_USD"]) if env.get("AIRLOCK_MAX_BUDGET_USD") else None,
         confine=env.get("AIRLOCK_CONFINE", "").lower() in ("1", "true", "yes"),
+        mcp_config=mcp_config,
+        skills=tuple(s.strip() for s in env.get("AIRLOCK_SKILLS", "").split(",") if s.strip()),
+        state_dir=Path(env["AIRLOCK_STATE_DIR"]) if env.get("AIRLOCK_STATE_DIR") else None,
     )
+
+
+def check_mcp_config(path: Path, workdir: Path) -> None:
+    """Refuse a node whose MCP configuration the agent could rewrite, or that does not load at all."""
+    if not safe_location(path, workdir):
+        raise SystemExit(
+            f"investigator: {path} is inside the working directory where the agent can write it; "
+            "put it outside, or under .claude/"
+        )
+    try:
+        load_mcp_servers(path)
+    except McpConfigError as exc:
+        raise SystemExit(f"investigator: {exc}") from exc
 
 
 # ---------------------------------------------------------------------- prompts
@@ -234,8 +264,10 @@ the fields of this example.
 
 Rules the plan is checked against before anyone sees it:
 - every step names one of the workers above and the target it touches;
-- a commands step is an exact argv, never a shell string, and the argv joined
-  with spaces must fully match one of that worker's allowlist patterns;
+- a commands step is an exact argv, never a shell string: one item per word,
+  split the way a shell would split it (an item with a space in it is quoted
+  when joined, and will not match a pattern that has no quotes). The joined
+  argv must fully match one of that worker's allowlist patterns;
 - "permissions" lists, for each worker you use, what it needs — only from what
   it may be granted — and no worker you do not use;
 - rollback and verification are concrete enough to act on.
@@ -266,7 +298,7 @@ class InvestigatorNode:
         self.config = config
         self.engine = engine
         self.client = client or httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=960.0))
-        self.state = config.workdir / ".airlock"
+        self.state = config.state_dir or config.workdir / ".airlock"
         self.state.mkdir(parents=True, exist_ok=True)
         self.sessions_file = self.state / "sessions.json"
         self.sessions: dict[str, str] = self._load_sessions()
@@ -359,7 +391,12 @@ class InvestigatorNode:
     def _policy(self, record_name: str, mcp_allowed: frozenset[str]) -> ToolPolicy:
         recorder = Recorder(self.state / "records" / f"{record_name}.jsonl")
         return ToolPolicy(
-            READONLY, self.config.workdir, mcp_allowed=mcp_allowed, record=recorder.write, confine=self.config.confine
+            READONLY,
+            self.config.workdir,
+            mcp_allowed=mcp_allowed,
+            record=recorder.write,
+            confine=self.config.confine,
+            private=(self.state,),
         )
 
     async def _investigate(self, payload: dict[str, Any]) -> None:
@@ -501,6 +538,8 @@ def build_engine(config: NodeConfig) -> Engine:
         model=config.model,
         tools=CONFINED_TOOLS if config.confine else BUILTIN_TOOLS,
         max_budget_usd=config.max_budget_usd,
+        mcp_config=config.mcp_config,
+        skills="all" if config.skills == ("all",) else list(config.skills),
     )
 
 
