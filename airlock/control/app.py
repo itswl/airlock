@@ -295,6 +295,11 @@ def create_app(
         checked(request, csrf)
         return back(work_id, plane.close(work_id, via="web", reason=reason), "已关闭")
 
+    @app.post("/work/{work_id}/fresh")
+    async def fresh(work_id: str, request: Request, csrf: str = Form("")) -> Response:
+        checked(request, csrf)
+        return back(work_id, plane.fresh(work_id, via="web"), "已交给调查员，用新会话从头调查")
+
     @app.post("/work/{work_id}/revoke")
     async def revoke(work_id: str, request: Request, csrf: str = Form("")) -> Response:
         checked(request, csrf)

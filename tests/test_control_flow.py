@@ -427,3 +427,49 @@ async def test_a_report_quoting_json_is_a_report(h: Harness) -> None:
     report = 'Pods look fine:\n\n```json\n{"items": [{"name": "api-1", "ready": true}]}\n```'
     assert h.plane.receive_result("infra", {"work_id": work_id, "text": report}).body == {"status": "answered"}
     assert '"api-1"' in h.plane.detail(work_id)["messages"][-1]["text"]  # type: ignore[index]
+
+
+async def test_the_dispatch_says_what_to_do_with_the_session(h: Harness) -> None:
+    work_id = await h.investigating()
+    assert h.investigations[-1]["session"] == {"mode": "resume"}
+    h.plane.receive_result("infra", {"work_id": work_id, "text": "a report", "session": "sess-1"})
+    assert h.plane.work(work_id)["engine_session"] == "sess-1"  # type: ignore[index]
+    assert h.plane.fresh(work_id, via="web").status == 200
+    await h.plane.tick()
+    assert h.investigations[-1]["session"] == {"mode": "fresh"}
+    assert "Starting over" not in str(h.investigations[-1])  # the prompt is the node's job; the directive is ours
+    h.plane.receive_result("infra", {"work_id": work_id, "text": "a second report"})
+    h.plane.operator_message(work_id, "and the cache?", via="web")
+    await h.plane.tick()
+    assert h.investigations[-1]["session"] == {"mode": "resume"}, "a fresh start happens once, then the item resumes"
+    assert h.kinds(work_id).count("investigation.fresh") == 1
+
+
+async def test_a_sequel_is_dispatched_as_a_fork_with_what_came_before(h: Harness) -> None:
+    work_id, current = await h.ready()
+    h.plane.reject(work_id, via="web", reason="not during the sale")
+    signal = {
+        "source": "web",
+        "event": "manual",
+        "title": "API 5xx",
+        "body": "again",
+        "url": "",
+        "key": "k1",
+        "labels": [],
+    }
+    h.plane.db.execute("UPDATE work_items SET key = 'k1' WHERE id = ?", [work_id])
+    previous = h.plane._concluded_with_key("web", "k1", 21600, "infra")
+    assert previous is not None and previous["id"] == work_id
+    sequel = h.plane.create_work(signal, "infra", actor="test", continues=previous)
+    await h.plane.tick()
+    sent = h.investigations[-1]
+    assert sent["work_id"] == sequel and sent["session"] == {"mode": "fork", "from": work_id}
+    assert sent["continues"]["state"] == "rejected" and sent["continues"]["plan_summary"] == current["plan"]["summary"]
+    detail = h.plane.detail(work_id)
+    assert detail is not None and [c["id"] for c in detail["continued_by"]] == [sequel]
+
+
+async def test_fresh_is_offered_only_where_it_makes_sense(h: Harness) -> None:
+    work_id, _, _ = await h.running()
+    assert h.plane.fresh(work_id, via="web").status == 409
+    assert h.plane.fresh("nope", via="web").status == 404

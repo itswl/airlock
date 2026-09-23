@@ -130,6 +130,7 @@ async def test_hooks_put_every_tool_call_to_the_policy_and_consult_is_one_tool(
     result = await ClaudeEngine(model="some-model").run(request, policy)
 
     options = seen["options"]
+    assert options.fork_session is False
     assert options.permission_mode == "bypassPermissions" and options.setting_sources == []
     assert options.resume == "sess-8" and options.model == "some-model" and options.cwd == str(tmp_path)
     assert options.system_prompt == {"type": "preset", "preset": "claude_code", "append": "be careful"}
@@ -178,3 +179,21 @@ def test_token_counts_keep_only_the_counters() -> None:
     }
     assert token_counts(usage) == {"input_tokens": 12, "output_tokens": 3, "cache_read_input_tokens": 7}
     assert token_counts(None) is None and token_counts({"service_tier": "standard"}) is None
+
+
+async def test_a_sequel_forks_the_session_it_continues(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, Any] = {}
+    sdk = fake_sdk(seen)
+
+    class Quiet(sdk.ClaudeSDKClient):  # type: ignore[name-defined, misc]
+        async def receive_response(self):  # noqa: ANN202
+            yield sdk.ResultMessage(result="ok", session_id="forked", total_cost_usd=0.0, is_error=False, num_turns=1)
+
+    sdk.ClaudeSDKClient = Quiet  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", sdk)
+    request = EngineRequest(
+        prompt="p", system="s", mode=READONLY, workdir=tmp_path, session="earlier", fork_session=True
+    )
+    result = await ClaudeEngine().run(request, ToolPolicy(READONLY, tmp_path))
+    assert seen["options"].resume == "earlier" and seen["options"].fork_session is True
+    assert result.session == "forked" and result.turns == 1

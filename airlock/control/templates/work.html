@@ -10,6 +10,9 @@
   {% if work.url %}· <a class="small" href="{{ work.url }}" rel="noreferrer noopener" target="_blank">原始链接</a>{% endif %}
 </p>
 {% if work.note %}<p class="small muted">{{ work.note }}</p>{% endif %}
+{% if continues %}<p class="small">接续 <a href="/work/{{ continues.id }}">#{{ continues.id }} {{ continues.title }}</a>（{{ STATE_LABELS.get(continues.state, continues.state) }}）：同一个信号又来了，调查员从那次的会话接着查。</p>{% endif %}
+{% for c in continued_by %}<p class="small">后续 <a href="/work/{{ c.id }}">#{{ c.id }}</a>（{{ STATE_LABELS.get(c.state, c.state) }}，{{ c.created_at|when }}）接续了这次调查。</p>{% endfor %}
+{% if work.signals > 1 %}<p class="small muted">这个信号已经来了 {{ work.signals }} 次，最近一次 {{ work.last_signal_at|when }}；重复的都并在这里，没有另开调查。</p>{% endif %}
 
 {% if current %}
 {% set plan = current.plan %}
@@ -132,6 +135,13 @@
     <textarea name="text" placeholder="有异议或补充？写在这里，调查员会按你的话修订方案（新版本要重新批准）"></textarea>
     <p><button>发给调查员</button></p>
   </form>
+  {% if "fresh" in work.actions %}
+  <form method="post" action="/work/{{ work.id }}/fresh" class="row">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button>新会话重查</button>
+    <span class="small muted">留言是接着原来的会话问；这个按钮让调查员丢掉之前的会话，从头查一遍</span>
+  </form>
+  {% endif %}
   {% if "close" in work.actions %}
   <form method="post" action="/work/{{ work.id }}/close" class="row">
     <input type="hidden" name="csrf" value="{{ csrf }}">

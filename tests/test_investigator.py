@@ -209,3 +209,53 @@ def test_node_configuration_comes_from_the_environment(tmp_path: Path) -> None:
     assert config.mcp_allowed == {"mcp__grafana__query", "mcp__jira__search"}
     with pytest.raises(SystemExit):
         load_node({})
+
+
+async def test_sessions_resume_fork_and_start_fresh_as_directed(tmp_path: Path) -> None:
+    investigator, control, engine = node(tmp_path, lambda r: StubTurn(text="ok"))
+    investigator.accept(payload())
+    await investigator.drain()
+    assert engine.requests[-1].session is None and investigator.sessions["w1"] == "stub-1"
+    assert control.received[-1][1]["session"] == "stub-1"
+
+    investigator.accept(payload(work_id="w2", session={"mode": "fork", "from": "w1"}))
+    await investigator.drain()
+    assert (engine.requests[-1].session, engine.requests[-1].fork_session) == ("stub-1", True)
+    assert investigator.sessions["w2"] == "stub-2" and investigator.sessions["w1"] == "stub-1"
+
+    investigator.accept(payload(work_id="w3", session={"mode": "fork", "from": "gone"}))
+    await investigator.drain()
+    assert (engine.requests[-1].session, engine.requests[-1].fork_session) == (None, False)
+
+    investigator.accept(payload(session={"mode": "fresh"}))
+    await investigator.drain()
+    assert engine.requests[-1].session is None and investigator.sessions["w1"] == "stub-4"
+
+    investigator.accept(payload(session={"mode": "resume"}))
+    await investigator.drain()
+    assert engine.requests[-1].session == "stub-4" and not engine.requests[-1].fork_session
+
+
+async def test_consults_about_one_work_item_continue_one_conversation(tmp_path: Path) -> None:
+    investigator, _, engine = node(tmp_path, lambda r: StubTurn(text="answer"))
+    await investigator.answer({"work_id": "w1", "from": "code", "question": "a?"})
+    await investigator.answer({"work_id": "w1", "from": "code", "question": "b?"})
+    await investigator.answer({"work_id": "w2", "from": "code", "question": "c?"})
+    assert [r.session for r in engine.requests] == [None, "stub-1", None]
+
+
+def test_the_prompt_says_when_this_is_the_same_signal_again() -> None:
+    sequel = {
+        "work_id": "w0",
+        "state": "done",
+        "concluded_at": 1_700_000_000,
+        "plan_summary": "Restart api",
+        "run_status": "done",
+        "note": "",
+    }
+    prompt = investigation_prompt(payload(continues=sequel, signals=3))
+    assert "The same signal again (after work item w0)" in prompt and "It ended done" in prompt
+    assert "Its plan: Restart api." in prompt and "has anything changed" in prompt
+    assert "arrived 3 times" in prompt
+    assert "Starting over" in investigation_prompt(payload(session={"mode": "fresh"}))
+    assert "Starting over" not in prompt

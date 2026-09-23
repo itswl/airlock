@@ -34,6 +34,10 @@ class EngineRequest:
     mode: str
     workdir: Path
     session: str | None = None
+    # With ``session``: branch a new session off it instead of appending to it,
+    # so a sequel starts from what the earlier investigation knew and the
+    # earlier session stays exactly as it was.
+    fork_session: bool = False
     consult: Consult | None = None
     consultable: tuple[str, ...] = ()
     mcp_allowed: frozenset[str] = frozenset()

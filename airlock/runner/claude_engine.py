@@ -147,6 +147,7 @@ class ClaudeEngine:
                 "PostToolUse": [HookMatcher(matcher=None, hooks=[post_tool])],
             },
             resume=request.session,
+            fork_session=bool(request.session and request.fork_session),
         )
 
         last_text, turns, result = "", 0, None

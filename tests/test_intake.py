@@ -129,3 +129,97 @@ def test_garbage_and_unknown_sources(plane: ControlPlane, env: dict[str, str]) -
 
 def test_a_resolved_alert_is_filtered(plane: ControlPlane, env: dict[str, str]) -> None:
     assert plane.intake("alerts", *alert(env, plane, status="resolved")).body == {"outcome": "filtered"}
+
+
+def test_an_alert_that_keeps_firing_keeps_joining(plane: ControlPlane, env: dict[str, str]) -> None:
+    first = plane.intake("alerts", *alert(env, plane)).body["work_id"]
+    for _ in range(3):
+        plane.clock.now += 500  # type: ignore[attr-defined]  # each gap is inside the 600s window, the total is not
+        assert plane.intake("alerts", *alert(env, plane)).body == {"outcome": "duplicate", "work_id": first}
+    assert plane.work(first)["signals"] == 4  # type: ignore[index]
+
+
+def test_a_repeat_after_the_work_item_ended_continues_it(plane: ControlPlane, env: dict[str, str]) -> None:
+    first = plane.intake("alerts", *alert(env, plane)).body["work_id"]
+    plane.close(first, via="web")
+    plane.clock.now += 3600  # type: ignore[attr-defined]
+    again = plane.intake("alerts", *alert(env, plane))
+    assert again.status == 202 and again.body["outcome"] == "continued" and again.body["continues"] == first
+    sequel = plane.work(again.body["work_id"])
+    assert sequel["continues"] == first and sequel["session_hint"] == f"fork:{first}"  # type: ignore[index]
+    plane.close(sequel["id"], via="web")  # type: ignore[index]
+    plane.clock.now += 21601  # type: ignore[attr-defined]
+    later = plane.intake("alerts", *alert(env, plane)).body
+    assert later["outcome"] == "accepted" and "continues" not in later
+
+
+def test_different_alerts_never_continue_each_other(plane: ControlPlane, env: dict[str, str]) -> None:
+    first = plane.intake("alerts", *alert(env, plane, fingerprint="fp1")).body["work_id"]
+    plane.close(first, via="web")
+    other = plane.intake("alerts", *alert(env, plane, fingerprint="fp2")).body
+    assert other["outcome"] == "accepted" and "continues" not in other
+
+
+def test_a_failed_investigation_is_not_worth_continuing(plane: ControlPlane, env: dict[str, str]) -> None:
+    first = plane.intake("alerts", *alert(env, plane)).body["work_id"]
+    plane.db.execute("UPDATE work_items SET state = 'error', concluded_at = NULL WHERE id = ?", [first])
+    assert plane.intake("alerts", *alert(env, plane)).body["outcome"] == "accepted"
+
+
+def test_an_open_report_is_superseded_by_its_sequel(plane: ControlPlane, env: dict[str, str]) -> None:
+    first = plane.intake("alerts", *alert(env, plane)).body["work_id"]
+    plane._set(first, state="answered")
+    plane.clock.now += 601  # type: ignore[attr-defined]  # quiet longer than the merge window
+    again = plane.intake("alerts", *alert(env, plane)).body
+    assert again["outcome"] == "continued" and again["continues"] == first
+    old = plane.work(first)
+    assert old["state"] == "closed" and again["work_id"] in old["note"]  # type: ignore[index]
+
+
+def test_split_gives_each_alert_its_own_work_item(config_dict: dict[str, Any], env: dict[str, str]) -> None:
+    config = dict(config_dict)
+    config["sources"] = [
+        *config_dict["sources"],
+        {
+            "name": "am",
+            "verify": "bearer",
+            "secret_env": "T_CI",
+            "split": "alerts",
+            "accept": [{"when": {"status": "firing"}}],
+            "map": {
+                "title": "{labels.alertname}",
+                "body": "{annotations.summary}",
+                "key": "{labels.alertname}|{labels.service}",
+            },
+        },
+    ]
+    plane = ControlPlane(load_control(config, env), clock=Clock())
+    group = {
+        "groupKey": '{}:{cluster="prod"}',
+        "status": "firing",
+        "alerts": [
+            {
+                "status": "firing",
+                "labels": {"alertname": "HighErrorRate", "service": "api"},
+                "annotations": {"summary": "5xx"},
+            },
+            {
+                "status": "firing",
+                "labels": {"alertname": "PoolExhausted", "service": "api"},
+                "annotations": {"summary": "10/10"},
+            },
+            {
+                "status": "resolved",
+                "labels": {"alertname": "DiskFull", "service": "db"},
+                "annotations": {"summary": "ok"},
+            },
+        ],
+    }
+    headers = {"Authorization": f"Bearer {env['T_CI']}"}
+    first = plane.intake("am", headers, json.dumps(group).encode())
+    assert first.status == 202 and first.body["outcome"] == "split"
+    assert [s["outcome"] for s in first.body["signals"]] == ["accepted", "accepted"]
+    titles = sorted(w["title"] for w in plane.list_work())
+    assert titles == ["HighErrorRate", "PoolExhausted"]
+    again = plane.intake("am", headers, json.dumps(group).encode())
+    assert again.status == 200 and [s["outcome"] for s in again.body["signals"]] == ["duplicate", "duplicate"]

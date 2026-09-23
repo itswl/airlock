@@ -35,7 +35,17 @@ launcher:
 #         bearer        Authorization: Bearer <secret> (Alertmanager, Grafana, anything that can set a header)
 # accept: which events become work; each rule's `when` is matched against the payload plus `event` and `source`.
 # map:    templates over the payload for title, body, url and key; `{a|b}` takes the first that has a value.
-#         Signals with the same key within dedup_seconds join the open work item instead of starting another.
+#
+# Sessions follow the key, never cross it:
+#   key               what "the same alert / issue / ticket" means. Different keys are different work
+#                     items with different investigator sessions, always.
+#   dedup_seconds     a repeat joins the open work item while its last signal is younger than this —
+#                     a sliding window, so an alert that keeps firing keeps joining (default 3600).
+#   continue_seconds  a repeat within this long after its work item concluded starts a new work item
+#                     that continues (forks) that investigator session (default 21600; 0 = always fresh).
+#   split             a list in the payload whose items are separate signals, so different alerts in
+#                     one notification never share a work item (Alertmanager and Grafana group them).
+# In the console, a message continues the session; "新会话重查" starts over in a new one.
 sources:
   - name: github
     verify: github
@@ -65,14 +75,18 @@ sources:
   - name: alertmanager
     verify: bearer
     secret_env: AIRLOCK_ALERTMANAGER_TOKEN
+    split: alerts                             # one notification carries a group; each alert is its own signal
     accept:
-      - when: {status: firing, commonLabels.severity: [critical, page]}
+      - when: {status: firing, labels.severity: [critical, page]}
     map:
-      title: "{commonLabels.alertname}: {commonAnnotations.summary}"
-      body: "{commonAnnotations.description}"
-      url: "{externalURL}"
-      key: "{groupKey}"
-    dedup_seconds: 14400                      # a flapping alert joins the same work item for four hours
+      title: "{labels.alertname}: {annotations.summary}"
+      body: "{annotations.description}"
+      url: "{generatorURL|externalURL}"
+      # One alert = alertname + where it fires. Not the fingerprint, which changes with every label
+      # (a new pod name would make the same problem a "different alert").
+      key: "{labels.alertname}|{labels.namespace}|{labels.service}"
+    dedup_seconds: 14400                      # longer than Alertmanager's repeat_interval, so re-sends keep joining
+    continue_seconds: 21600
     labels: [alert]
 
 # ---------------------------------------------------------------- routing: first match wins

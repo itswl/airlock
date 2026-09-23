@@ -32,6 +32,18 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True)
 class Source:
+    """One door into the pipe.
+
+    ``key`` (in ``templates``) names "the same thing": signals with one key are
+    one alert, one issue, one ticket. ``dedup_seconds`` is how long a quiet
+    spell may be before a repeat stops joining the open work item — measured
+    from the last signal, so an alert that keeps firing keeps joining.
+    ``continue_seconds`` is how long after a work item ended a repeat still
+    continues its investigator's session in a new work item. ``split`` names a
+    list in the payload (Alertmanager's ``alerts``) whose items are separate
+    signals, so different alerts in one notification never share a session.
+    """
+
     name: str
     verify: str
     secret: str
@@ -40,6 +52,8 @@ class Source:
     labels: tuple[str, ...] = ()
     event_header: str | None = None
     dedup_seconds: int = 3600
+    continue_seconds: int = 21600
+    split: str | None = None
 
 
 @dataclass(frozen=True)
@@ -232,6 +246,8 @@ def load_control(source: str | Path | Mapping[str, Any], env: Mapping[str, str] 
             labels=tuple(str(label) for label in item.get("labels") or ()),
             event_header=item.get("event_header", default_header),
             dedup_seconds=int(item.get("dedup_seconds", 3600)),
+            continue_seconds=int(item.get("continue_seconds", 21600)),
+            split=str(item["split"]) if item.get("split") else None,
         )
 
     inv_raw = list(data.get("investigators") or [])

@@ -33,10 +33,16 @@ CREATE TABLE IF NOT EXISTS work_items (
     auto_revisions INTEGER NOT NULL DEFAULT 0,
     last_seen_message INTEGER NOT NULL DEFAULT 0,
     dispatched_at REAL NOT NULL DEFAULT 0,
+    last_signal_at REAL NOT NULL DEFAULT 0,
+    signals INTEGER NOT NULL DEFAULT 1,
+    concluded_at REAL,
+    continues TEXT,
+    session_hint TEXT NOT NULL DEFAULT '',
+    engine_session TEXT NOT NULL DEFAULT '',
     note TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS work_state ON work_items(state, next_dispatch_at);
-CREATE INDEX IF NOT EXISTS work_key ON work_items(source, key, created_at);
+CREATE INDEX IF NOT EXISTS work_key ON work_items(source, key, last_signal_at);
 CREATE TABLE IF NOT EXISTS plans (
     work_id TEXT NOT NULL REFERENCES work_items(id),
     version INTEGER NOT NULL,
@@ -130,19 +136,25 @@ TERMINAL = ("done", "failed", "refused", "cancelled", "rejected", "closed", "err
 ACTIONS: dict[str, tuple[str, ...]] = {
     "queued": ("message", "close"),
     "investigating": ("message", "close"),
-    "answered": ("message", "close"),
-    "plan_ready": ("approve", "message", "reject"),
+    "answered": ("message", "fresh", "close"),
+    "plan_ready": ("approve", "message", "fresh", "reject"),
     "approved": ("revoke", "message"),
     "running": ("cancel", "message"),
-    "plan_invalid": ("message", "close"),
-    "error": ("message", "close"),
-    "failed": ("message",),
-    "refused": ("message",),
-    "cancelled": ("message",),
-    "done": ("message",),
-    "rejected": ("message",),
-    "closed": ("message",),
+    "plan_invalid": ("message", "fresh", "close"),
+    "error": ("message", "fresh", "close"),
+    "failed": ("message", "fresh"),
+    "refused": ("message", "fresh"),
+    "cancelled": ("message", "fresh"),
+    "done": ("message", "fresh"),
+    "rejected": ("message", "fresh"),
+    "closed": ("message", "fresh"),
 }
+
+# A work item in one of these has concluded: the investigation answered, or
+# what came of its plan is known. A repeat of its signal soon after continues
+# its investigator's session in a new work item. Not after an error or a plan
+# that never validated: that session is not one worth building on.
+CONCLUDED = ("answered", "done", "failed", "refused", "cancelled", "rejected", "closed")
 
 # A message from you in one of these sends the work item back to its
 # investigator. In the others it is recorded and read on the next round.

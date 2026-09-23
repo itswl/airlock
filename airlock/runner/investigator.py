@@ -40,6 +40,7 @@ import contextlib
 import json
 import logging
 import os
+import time
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -172,6 +173,34 @@ def investigation_prompt(payload: Mapping[str, Any]) -> str:
         f"source: {signal.get('source', '')}\ntitle: {signal.get('title', '')}\nurl: {signal.get('url', '')}",
         f"```text\n{signal.get('body', '')}\n```",
     ]
+    sequel = payload.get("continues")
+    if sequel:
+        ended = (
+            time.strftime("%Y-%m-%d %H:%M", time.localtime(sequel["concluded_at"]))
+            if sequel.get("concluded_at")
+            else "?"
+        )
+        parts.append(f"## The same signal again (after work item {sequel['work_id']})")
+        facts = [f"It ended {sequel.get('state')} at {ended}."]
+        if sequel.get("plan_summary"):
+            facts.append(f"Its plan: {sequel['plan_summary']}.")
+        if sequel.get("run_status"):
+            facts.append(f"The plan's run: {sequel['run_status']}.")
+        if sequel.get("note"):
+            facts.append(f"Note: {sequel['note']}")
+        parts.append(" ".join(facts))
+        parts.append(
+            "Your session from that investigation is continued, so you have what you found then. Compare against "
+            "your earlier conclusion first: has anything changed — worse, better, a different symptom? If the "
+            "earlier conclusion or plan still holds, say so briefly and why; if not, investigate what changed."
+        )
+    elif (payload.get("session") or {}).get("mode") == "fresh":
+        parts.append(
+            "## Starting over\nThe person asked for a fresh investigation. Earlier conclusions on this work item "
+            "may be wrong; do not assume them — check again."
+        )
+    if int(payload.get("signals") or 1) > 1:
+        parts.append(f"The signal has arrived {payload['signals']} times; the repeats are in the conversation below.")
     messages = payload.get("messages") or []
     if messages:
         parts.append("## The conversation so far")
@@ -289,6 +318,28 @@ class InvestigatorNode:
         self.running[work_id] = asyncio.create_task(self._investigate(dict(payload)))
         return 202, {"status": "accepted"}
 
+    def _session_for(self, work_id: str, directive: Mapping[str, Any]) -> tuple[str | None, bool]:
+        """(session to resume, whether to fork it) for this round, as the control plane directs.
+
+        resume  this work item's own session, if it has one
+        fork    branch off another work item's session: a sequel of that one
+        fresh   none: the person asked to start over
+        """
+        mode = str(directive.get("mode") or "resume")
+        if mode == "fresh":
+            self.sessions.pop(work_id, None)
+            self._save_sessions()
+            return None, False
+        if mode == "fork":
+            origin = self.sessions.get(str(directive.get("from") or ""))
+            if origin:
+                return origin, True
+            logger.info(
+                "%s continues %s, whose session is not on this node; starting fresh", work_id, directive.get("from")
+            )
+            return None, False
+        return self.sessions.get(work_id), False
+
     async def _consult(self, work_id: str, to: str, question: str) -> str:
         try:
             response = await self._post(
@@ -317,12 +368,14 @@ class InvestigatorNode:
             try:
                 consultable = tuple(str(n) for n in payload.get("consultable") or ())
                 mcp_allowed = self.config.mcp_allowed | ({CONSULT_TOOL} if consultable else set())
+                session, fork = self._session_for(work_id, payload.get("session") or {})
                 request = EngineRequest(
                     prompt=investigation_prompt(payload),
                     system=system_prompt(self.config),
                     mode=READONLY,
                     workdir=self.config.workdir,
-                    session=self.sessions.get(work_id),
+                    session=session,
+                    fork_session=fork,
                     consult=(lambda to, q: self._consult(work_id, to, q)) if consultable else None,
                     consultable=consultable,
                     mcp_allowed=frozenset(mcp_allowed),
@@ -346,6 +399,7 @@ class InvestigatorNode:
                             "turns": result.turns,
                             "refusals": result.refusals,
                             "usage": dict(result.usage or {}),
+                            "session": result.session,
                         },
                     )
             except Exception as exc:  # noqa: BLE001 — the control plane must hear about every ending
@@ -361,11 +415,15 @@ class InvestigatorNode:
         if not self.ready:
             return 503, {"reason": "posture checks failed"}
         work_id = str(payload.get("work_id") or "")
+        # Questions about one work item continue one conversation on this side
+        # too; a different work item never shares it.
+        consult_key = f"consult:{work_id}"
         request = EngineRequest(
             prompt=consult_prompt(payload),
             system=system_prompt(self.config),
             mode=READONLY,
             workdir=self.config.workdir,
+            session=self.sessions.get(consult_key),
             consult=None,
             mcp_allowed=self.config.mcp_allowed,
             max_turns=self.config.max_turns,
@@ -374,6 +432,9 @@ class InvestigatorNode:
         )
         async with self.semaphore:
             result = await self.engine.run(request, self._policy(f"consult-{work_id}", request.mcp_allowed))
+        if result.session:
+            self.sessions[consult_key] = result.session
+            self._save_sessions()
         return 200, {
             "answer": result.text or (result.error or "no answer"),
             "cost_usd": result.cost_usd,

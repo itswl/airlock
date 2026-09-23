@@ -24,7 +24,7 @@ from airlock.crypto import (
     verify_bearer,
     verify_hub_signature,
 )
-from airlock.templating import matches, render
+from airlock.templating import matches, render, resolve
 
 MAX_BODY_BYTES = 1_048_576
 
@@ -55,6 +55,21 @@ def context(source: Source, headers: Mapping[str, str], payload: Mapping[str, An
     """What accept rules and templates see: the payload, plus ``event`` and ``source``."""
     event = header(headers, source.event_header) if source.event_header else str(payload.get("event") or "")
     return {**payload, "event": event, "source": source.name}
+
+
+def contexts(source: Source, headers: Mapping[str, str], payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """One context per signal. With ``split``, each item of that list is its own signal and
+    sees its own fields on top of the notification's (``{labels.alertname}``, ``{fingerprint}``)."""
+    base = context(source, headers, payload)
+    if not source.split:
+        return [base]
+    items = resolve(payload, source.split)
+    if not isinstance(items, list):
+        return []
+    shared = {k: v for k, v in base.items() if k != source.split.split(".")[0]}
+    return [
+        {**shared, **item, "event": base["event"], "source": source.name} for item in items if isinstance(item, dict)
+    ]
 
 
 def accepted(source: Source, ctx: Mapping[str, Any]) -> bool:

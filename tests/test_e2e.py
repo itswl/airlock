@@ -262,3 +262,29 @@ async def test_github_issue_routes_to_the_code_investigator(
     work = system.plane.work(work_id)
     assert work["investigator"] == "code" and work["state"] == "answered"  # type: ignore[index]
     await system.close()
+
+
+async def test_the_same_alert_after_the_fix_continues_the_investigators_session(
+    tmp_path: Path, config_dict: dict[str, Any], env: dict[str, str]
+) -> None:
+    system = System(tmp_path, config_dict, env)
+    first = await system.alert()
+    await system.settle()
+    await system.login()
+    _, csrf, digest, version = await system.page(first)
+    await system.web.post(f"/work/{first}/approve", data={"version": version, "plan_hash": digest, "csrf": csrf})
+    await system.settle()
+    assert system.plane.work(first)["state"] == "done"  # type: ignore[index]
+    infra = system.nodes["infra"]
+    first_session = infra.sessions[first]
+
+    second = await system.alert()  # the same alert again, now that its work item is done
+    assert second != first
+    await system.settle()
+    request = infra.engine.requests[-1]  # type: ignore[attr-defined]
+    assert (request.session, request.fork_session) == (first_session, True)
+    assert "The same signal again (after work item" in request.prompt and "It ended done" in request.prompt
+    assert infra.sessions[second] != first_session and infra.sessions[first] == first_session
+    page = (await system.web.get(f"/work/{second}")).text
+    assert f"/work/{first}" in page and "接续" in page
+    await system.close()

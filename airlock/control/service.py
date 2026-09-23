@@ -37,7 +37,7 @@ import httpx
 from airlock.config import ControlConfig
 from airlock.control import intake
 from airlock.control.outbox import Outbox
-from airlock.control.store import ACTIONS, REOPENS, SCHEMA, TERMINAL
+from airlock.control.store import ACTIONS, CONCLUDED, REOPENS, SCHEMA, TERMINAL
 from airlock.crypto import PROFILE_HEADER, SignatureError, canonical_json, sha256_hex, sign
 from airlock.db import Database
 from airlock.ledger import Ledger
@@ -96,6 +96,10 @@ class ControlPlane:
 
     def _set(self, work_id: str, **fields: Any) -> None:
         fields["updated_at"] = self.clock()
+        if "state" in fields:
+            # When the work item last concluded — what a repeat of its signal is
+            # measured against to decide whether it continues this session.
+            fields["concluded_at"] = fields["updated_at"] if fields["state"] in CONCLUDED else None
         assignments = ", ".join(f"{name} = ?" for name in fields)
         self.db.execute(f"UPDATE work_items SET {assignments} WHERE id = ?", [*fields.values(), work_id])  # noqa: S608
 
@@ -183,56 +187,81 @@ class ControlPlane:
         except (ValueError, UnicodeDecodeError) as exc:
             self._event(source_name, "invalid", str(exc), digest=digest)
             return Outcome(400, {"outcome": "invalid", "reason": str(exc)})
-        ctx = intake.context(source, headers, payload)
-        if not intake.accepted(source, ctx):
+        signals = [
+            intake.normalize(source, ctx)
+            for ctx in intake.contexts(source, headers, payload)
+            if intake.accepted(source, ctx)
+        ]
+        if not signals:
             self._event(source_name, "filtered", "no accept rule matched", digest=digest)
             return Outcome(200, {"outcome": "filtered"})
-        signal = intake.normalize(source, ctx)
-        existing = self._open_work_with_key(source_name, signal["key"], source.dedup_seconds)
+        results = [self._take(source, signal, digest) for signal in signals]
+        started = any(r["outcome"] in ("accepted", "continued") for r in results)
+        if source.split is None:
+            return Outcome(202 if started else 200, results[0])
+        return Outcome(202 if started else 200, {"outcome": "split", "signals": results})
+
+    def _take(self, source: Any, signal: Mapping[str, Any], digest: str) -> dict[str, Any]:
+        """One signal: join the open work item it repeats, continue one that just ended, or start fresh."""
+        name, key, title = source.name, signal["key"], signal["title"]
+        existing = self._open_work_with_key(name, key, source.dedup_seconds)
         if existing is not None:
-            update = f"{signal['title']}\n\n{signal['body']}".strip()
-            self._message(existing["id"], f"source:{source_name}", update, via="webhook")
-            self._event(
-                source_name,
-                "duplicate",
-                key=signal["key"],
-                title=signal["title"],
-                work_id=existing["id"],
-                digest=digest,
+            update = f"{title}\n\n{signal['body']}".strip()
+            self._message(existing["id"], f"source:{name}", update, via="webhook")
+            self.db.execute(
+                "UPDATE work_items SET last_signal_at = ?, signals = signals + 1 WHERE id = ?",
+                [self.clock(), existing["id"]],
             )
+            self._event(name, "duplicate", key=key, title=title, work_id=existing["id"], digest=digest)
             self.ledger.append(
-                "signal.duplicate", work_id=existing["id"], actor=f"source:{source_name}", data={"key": signal["key"]}
+                "signal.duplicate",
+                work_id=existing["id"],
+                actor=f"source:{name}",
+                data={"key": key, "signals": existing["signals"] + 1},
             )
-            return Outcome(200, {"outcome": "duplicate", "work_id": existing["id"]})
+            return {"outcome": "duplicate", "work_id": existing["id"]}
         investigator = intake.route(self.config, signal)
         if investigator is None:
-            self._event(
-                source_name, "unrouted", "no route matched", key=signal["key"], title=signal["title"], digest=digest
-            )
-            self.ledger.append(
-                "signal.unrouted", actor=f"source:{source_name}", data={"key": signal["key"], "title": signal["title"]}
-            )
-            return Outcome(200, {"outcome": "unrouted"})
-        work_id = self.create_work(signal, investigator, actor=f"source:{source_name}")
-        self._event(source_name, "accepted", key=signal["key"], title=signal["title"], work_id=work_id, digest=digest)
-        return Outcome(202, {"outcome": "accepted", "work_id": work_id})
+            self._event(name, "unrouted", "no route matched", key=key, title=title, digest=digest)
+            self.ledger.append("signal.unrouted", actor=f"source:{name}", data={"key": key, "title": title})
+            return {"outcome": "unrouted"}
+        previous = self._concluded_with_key(name, key, source.continue_seconds, investigator)
+        work_id = self.create_work(signal, investigator, actor=f"source:{name}", continues=previous)
+        outcome = "continued" if previous else "accepted"
+        self._event(name, outcome, key=key, title=title, work_id=work_id, digest=digest)
+        return {"outcome": outcome, "work_id": work_id, **({"continues": previous["id"]} if previous else {})}
 
     def _open_work_with_key(self, source: str, key: str, window: int) -> dict[str, Any] | None:
+        """The open work item this signal repeats, if its last signal is recent enough."""
         placeholders = ",".join("?" * len(TERMINAL))
-        query = f"SELECT id FROM work_items WHERE source = ? AND key = ? AND created_at >= ? AND state NOT IN ({placeholders}) ORDER BY created_at DESC LIMIT 1"  # noqa: S608
+        query = f"SELECT id FROM work_items WHERE source = ? AND key = ? AND last_signal_at >= ? AND state NOT IN ({placeholders}) ORDER BY last_signal_at DESC LIMIT 1"  # noqa: S608
         row = self.db.one(query, [source, key, self.clock() - window, *TERMINAL])
         return self.work(row["id"]) if row else None
 
-    def create_work(self, signal: Mapping[str, Any], investigator: str, *, actor: str) -> str:
+    def _concluded_with_key(self, source: str, key: str, window: int, investigator: str) -> dict[str, Any] | None:
+        """The work item this signal is a sequel to: same key, same investigator, concluded within the window."""
+        if window <= 0:
+            return None
+        placeholders = ",".join("?" * len(CONCLUDED))
+        query = f"SELECT id FROM work_items WHERE source = ? AND key = ? AND investigator = ? AND concluded_at >= ? AND state IN ({placeholders}) ORDER BY concluded_at DESC LIMIT 1"  # noqa: S608
+        row = self.db.one(query, [source, key, investigator, self.clock() - window, *CONCLUDED])
+        return self.work(row["id"]) if row else None
+
+    def create_work(
+        self, signal: Mapping[str, Any], investigator: str, *, actor: str, continues: Mapping[str, Any] | None = None
+    ) -> str:
         work_id = uuid.uuid4().hex[:12]
         now = self.clock()
         self.db.execute(
-            "INSERT INTO work_items (id, created_at, updated_at, source, key, title, url, body, labels, fields, "
-            "investigator, state) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO work_items (id, created_at, updated_at, last_signal_at, continues, session_hint, source, key, "
+            "title, url, body, labels, fields, investigator, state) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [
                 work_id,
                 now,
                 now,
+                now,
+                continues["id"] if continues else None,
+                f"fork:{continues['id']}" if continues else "",
                 signal["source"],
                 signal["key"],
                 signal["title"],
@@ -253,9 +282,16 @@ class ControlPlane:
                 "key": signal["key"],
                 "title": signal["title"],
                 "investigator": investigator,
+                "continues": continues["id"] if continues else None,
             },
         )
-        self._notify("work.created", work_id, investigator=investigator)
+        if continues is not None and continues["state"] == "answered":
+            # A report nobody closed, now superseded by the sequel that continues it.
+            self._set(continues["id"], state="closed", note=f"continued in {work_id}")
+            self.ledger.append("work.superseded", work_id=continues["id"], data={"by": work_id})
+        self._notify(
+            "work.created", work_id, investigator=investigator, continues=continues["id"] if continues else None
+        )
         return work_id
 
     def manual_signal(self, title: str, body: str) -> Outcome:
@@ -311,12 +347,32 @@ class ControlPlane:
         return {
             "work_id": work["id"],
             "signal": {k: work[k] for k in ("source", "key", "title", "url", "body", "labels", "fields")},
+            "signals": work["signals"],
             "messages": messages,
             "latest_plan": latest["plan"] if latest else None,
             "latest_version": work["current_version"],
             "latest_errors": json.loads(last["errors"]) if last else [],
             "note": work["note"],
+            "session": session_directive(work["session_hint"]),
+            "continues": self._sequel_of(work["continues"]) if work["continues"] else None,
             **self._catalogue(work["investigator"]),
+        }
+
+    def _sequel_of(self, work_id: str) -> dict[str, Any] | None:
+        """What an investigator needs to know about the work item it is continuing."""
+        previous = self.work(work_id)
+        if previous is None:
+            return None
+        plan = self.plan_row(work_id, previous["current_version"]) if previous["current_version"] else None
+        run = self.db.one("SELECT status FROM runs WHERE work_id = ? ORDER BY received_at DESC LIMIT 1", [work_id])
+        return {
+            "work_id": work_id,
+            "title": previous["title"],
+            "state": previous["state"],
+            "note": previous["note"],
+            "concluded_at": previous["concluded_at"],
+            "plan_summary": plan["plan"]["summary"] if plan else None,
+            "run_status": run["status"] if run else None,
         }
 
     async def _dispatch(self, work_id: str) -> None:
@@ -341,7 +397,8 @@ class ControlPlane:
         try:
             response = await self._post(f"{profile.url}/investigate", profile.secret, payload)
             if response.status_code in (200, 202):
-                self._set(work_id, dispatch_attempts=0)
+                # The directive was delivered; later rounds resume this item's own session.
+                self._set(work_id, dispatch_attempts=0, session_hint="")
                 return
             error = f"HTTP {response.status_code}"
         except httpx.HTTPError as exc:
@@ -399,6 +456,10 @@ class ControlPlane:
         assert work is not None
         text = str(payload.get("text") or "")
         usage = {k: payload[k] for k in ("cost_usd", "turns", "refusals", "usage") if k in payload}
+        if payload.get("session"):
+            self.db.execute(
+                "UPDATE work_items SET engine_session = ? WHERE id = ?", [str(payload["session"])[:200], work["id"]]
+            )
         prose = strip_plans(text)
         if prose:
             self._message(work["id"], f"investigator:{profile}", prose, via="investigation")
@@ -675,6 +736,25 @@ class ControlPlane:
         )
         self._notify("work.closed", work_id, via=via)
         return Outcome(200, {"status": "closed"})
+
+    def fresh(self, work_id: str, *, via: str) -> Outcome:
+        """Investigate again from nothing: a new engine session, nothing carried over but the record."""
+        work = self.work(work_id)
+        if work is None:
+            return Outcome(404, {"reason": "no such work item"})
+        if "fresh" not in work["actions"]:
+            return Outcome(409, {"reason": f"a work item that is {work['state']} cannot start over"})
+        self._set(
+            work_id,
+            state="queued",
+            session_hint="fresh",
+            next_dispatch_at=self.clock(),
+            auto_revisions=0,
+            dispatch_attempts=0,
+            note="starting over in a new session",
+        )
+        self.ledger.append("investigation.fresh", work_id=work_id, actor=self.operator, data={"via": via})
+        return Outcome(200, {"status": "queued"})
 
     def revoke(self, work_id: str, *, via: str) -> Outcome:
         """Take an approval back before the launcher has it. After that, cancel the run instead."""
@@ -968,6 +1048,10 @@ class ControlPlane:
         previous = next((p for p in plans if p["version"] < work["current_version"] and not p["errors"]), None)
         return {
             "work": work,
+            "continues": self.work(work["continues"]) if work["continues"] else None,
+            "continued_by": self.db.all(
+                "SELECT id, title, state, created_at FROM work_items WHERE continues = ? ORDER BY created_at", [work_id]
+            ),
             "current": current,
             "changes": plan_diff(previous["plan"], current["plan"]) if current and previous else "",
             "previous_version": previous["version"] if current and previous else None,
@@ -999,3 +1083,12 @@ def plan_diff(before: Mapping[str, Any], after: Mapping[str, Any]) -> str:
     old = json.dumps(before, indent=2, sort_keys=True, ensure_ascii=False).splitlines()
     new = json.dumps(after, indent=2, sort_keys=True, ensure_ascii=False).splitlines()
     return "\n".join(difflib.unified_diff(old, new, "before", "after", lineterm="", n=2))
+
+
+def session_directive(hint: str) -> dict[str, str]:
+    """What the investigator does with its engine session this round."""
+    if hint == "fresh":
+        return {"mode": "fresh"}
+    if hint.startswith("fork:"):
+        return {"mode": "fork", "from": hint[5:]}
+    return {"mode": "resume"}
