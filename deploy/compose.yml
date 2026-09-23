@@ -8,12 +8,15 @@
 #   AIRLOCK_CONSOLE_PORT   where the console listens on 127.0.0.1 (default 8080)
 #   DOCKER_GID             the group that owns the Docker socket (0 on Docker Desktop / OrbStack)
 #   AIRLOCK_EGRESS_ALLOW   the hosts investigators may reach through the proxy (the model gateway among them)
+#   AIRLOCK_INFRA_MCP_ALLOWED  the MCP tools the infra investigator may call, e.g. mcp__alerts__get_*,mcp__alerts__list_*
+#   COMPOSE_PROFILES=mcp-gate  also start the MCP gateway (mcp-gate.json, mcp-gate.env; see airlock/mcpgate.py)
 #
-# Four networks, so that who can reach whom is the diagram, not a hope:
+# Five networks, so that who can reach whom is the diagram, not a hope:
 #   investigate  control plane <-> investigators
 #   launch       control plane <-> launcher          (investigators cannot reach the launcher at all)
 #   egress       investigators  -> egress proxy      (their only way out)
-#   outside      control plane and the proxy          (webhooks in and out, allowlisted egress)
+#   tools        investigators  -> MCP gateway       (only the investigators that use it)
+#   outside      control plane, the proxy and the MCP gateway (webhooks in and out, allowlisted egress, MCP servers)
 # Worker containers are started by the launcher through the Docker socket, on
 # the network each worker profile names; create those networks yourself.
 
@@ -23,6 +26,7 @@ networks:
   investigate: {internal: true}
   launch: {internal: true}
   egress: {internal: true}
+  tools: {internal: true}
   outside: {}
 
 services:
@@ -64,12 +68,12 @@ services:
       AIRLOCK_STATE_DIR: /state                                  # sessions and records, out of the agent's sight
       AIRLOCK_INSTRUCTIONS_FILE: /etc/airlock/infra.md
       AIRLOCK_POSTURE_FILE: /etc/airlock/posture-infra.yaml
-      AIRLOCK_MCP_CONFIG: /etc/airlock/mcp-infra.json            # read-only credentials only, like everything here
-      AIRLOCK_MCP_ALLOWED: mcp__grafana__query,mcp__grafana__list_dashboards
+      AIRLOCK_MCP_CONFIG: /etc/airlock/mcp-infra.json            # read-only credentials, or a server behind mcp-gate
+      AIRLOCK_MCP_ALLOWED: ${AIRLOCK_INFRA_MCP_ALLOWED:-}
       AIRLOCK_SKILLS: all
       HTTPS_PROXY: http://egress:8888
       HTTP_PROXY: http://egress:8888
-      NO_PROXY: control
+      NO_PROXY: control,mcp-gate
       KUBECONFIG: /creds/kubeconfig
       AWS_SHARED_CREDENTIALS_FILE: /creds/aws-credentials
     env_file: investigator-infra.env   # AIRLOCK_SECRET (= AIRLOCK_INVESTIGATOR_INFRA_SECRET), the model API key
@@ -85,7 +89,7 @@ services:
     tmpfs: [/tmp]
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    networks: [investigate, egress]
+    networks: [investigate, egress, tools]
     restart: unless-stopped
 
   investigator-code:
@@ -109,6 +113,26 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     networks: [investigate, egress]
+    restart: unless-stopped
+
+  # MCP servers whose credential can also write. The gateway holds the credential and
+  # forwards only the tools mcp-gate.json names; an investigator gets a token that
+  # is good only here. Its record of every call is data/mcp-gate/calls.jsonl.
+  mcp-gate:
+    image: ${AIRLOCK_IMAGE:-airlock:0.1}
+    profiles: [mcp-gate]
+    command: [python, -m, airlock.mcpgate, --config, /etc/airlock/mcp-gate.json, --host, 0.0.0.0, --port, "8097",
+              --record, /records/calls.jsonl]
+    env_file:
+      - path: mcp-gate.env             # the servers' credentials, one token per investigator that uses it
+        required: false                # unset, the gateway names the missing variable and stops
+    volumes:
+      - ./mcp-gate.json:/etc/airlock/mcp-gate.json:ro
+      - ${AIRLOCK_ROOT:-/opt/airlock}/data/mcp-gate:/records
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [tools, outside]
     restart: unless-stopped
 
   egress:

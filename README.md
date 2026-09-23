@@ -65,7 +65,7 @@
 | 自带审计日志                          |--原生审计---->| 执行记录：每条命令、输出、结果       |
 | AWS 调用带上批准编号                  |               | 记录在启动器这边，不在容器里         |
 +---------------------------------------+               | 链头随每次执行外发存证               |
-                                                        | 对账原生审计：下一步，未实现         |
+                                                        | 原生审计对账：airlock.reconcile      |
                                                         +--------------------------------------+
 ```
 
@@ -121,21 +121,47 @@ CLI 报的 `cost_usd` 是它按自己的价目表估的，续接的会话里还�
 每个调查节点用环境变量配（和 hookprobe 的做法一样）：
 
 - `AIRLOCK_MCP_CONFIG`：MCP 服务器清单，`.mcp.json` 的格式（`{"mcpServers": {...}}`）。**每次运行重新读**，改了下一次就生效；CLI 只认这一份（strict），别处的设置加不了服务器。文件要放在工作目录外，或者工作目录的 `.claude/` 下，调查员写不了的地方，否则节点拒绝启动。
-- `AIRLOCK_MCP_ALLOWED`：调查员能调的 MCP 工具，逐个列出（`mcp__<服务器>__<工具>`，或者 `mcp__<服务器>__*`）。挂上服务器不等于给了它的工具，没列的一律拒绝并记录。
+- `AIRLOCK_MCP_ALLOWED`：调查员能调的 MCP 工具，逐个列出（`mcp__<服务器>__<工具>`），也可以写一台服务器里的模式（`mcp__<服务器>__*`、`mcp__<服务器>__get_*`；模式不跨服务器）。挂上服务器不等于给了它的工具，没列的一律拒绝并记录。
 - `AIRLOCK_SKILLS`：`all` 或名单。skills 放在 `工作目录/.claude/skills/<名字>/SKILL.md`，由你只读挂载。打开 skills 后，CLI 也会读工作目录的 `.claude/settings.json` 和 `CLAUDE.md`，这些调查员同样改不了。
 
 - `AIRLOCK_STATE_DIR`：节点自己的会话和每个工作项的记录。守卫不让调查员读它（否则一个工作项的调查能翻到别的工作项的记录）；最好放在工作目录外，眼不见为净。
 
-真 CLI 验证过（2026-09-23）：放行的 MCP 工具能调通；没放行的被闸门拦下，服务器那边根本没执行；skill 被加载，并且模型照着它做了。
+真 CLI 验证过（2026-09-23）：
+- 放行的 MCP 工具能调通；没放行的被闸门拦下，服务器那边根本没执行。
+- skill 被加载，模型也照着它做了。
+- 在云服务器的部署上，infra 调查员经网关接了一个真实告警平台的 MCP：
+  - 网关只列出 18 个只读工具，提议修复和试跑载荷这两个工具不在其中；
+  - 真 CLI 在容器里用节点自己的配置调通了其中两个；
+  - 不在名单上的调用被网关拒掉，token 不对返回 401；
+  - 调查员直连那台服务器解析不到域名，经出网代理返回 403。
 
 **边界**：MCP 服务器能碰到什么，取决于它的凭证；调查员和它在同一个容器里、同一个用户，那些凭证调查员也读得到。所以给调查员的 MCP 服务器也只能配只读凭证，工具放行名单是第二道防线，不是边界。
+
+**凭证能写的服务器放到网关后面**（`airlock/mcpgate.py`，compose 里的 `mcp-gate`，`.env` 里写 `COMPOSE_PROFILES=mcp-gate` 打开）。有的服务只发一种 API key，能读也能写，比如同一个 key 既能查告警，也能确认告警。这种服务器不直接交给调查员：网关拿着凭证，调查员只拿一个只在网关有效的 token。网关的规则：
+
+- `tools/call` 只转发 `mcp-gate.json` 里为这台服务器列出的工具，可以写 `get_*` 这样的模式；
+- `tools/list` 的结果里别的工具都删掉，调查员根本看不到；
+- 协议自己的请求照常转发（初始化、列举、读资源）；此外的请求网关直接回 JSON-RPC 错误，到不了服务器；
+- 每次工具调用都记进网关自己的哈希链记录，放行和拒绝的都记。
+
+调查员不在网关出网的那个网络上，连服务器的域名都解析不到。
+
+`python scripts/mcpgate_check.py [--engine claude]` 用演示 MCP 服务器真跑一遍，服务器用的是有会话、SSE 流的默认模式。原始协议和真 CLI 都只看得到放行的那个工具；越权调用被网关拒掉，服务器日志里没有这次调用。
 
 ## 部署
 
 - `config.example.yaml`：带注释的完整配置（来源、路由、调查画像、工作画像、订阅、适配器）。密钥只写环境变量名。
 - 进程：`python -m airlock.control --config config.yaml`、`python -m airlock.launcher --config config.yaml`、每个调查画像一个 `python -m airlock.runner.investigator`（环境变量配置，见 `airlock/runner/investigator.py` 顶部），出网代理 `python -m airlock.egress.proxy`。
 - 操作员密码：`python -m airlock.control.passwd` 生成 scrypt 哈希，放进 `AIRLOCK_OPERATOR_PASSWORD_HASH`。
-- `deploy/Dockerfile`（通用镜像）、`deploy/Dockerfile.launcher`（加 Docker CLI，只有它拿 Docker socket）、`deploy/Dockerfile.investigator`（加 Claude Agent SDK）、`deploy/compose.yml`（单机编排，四个网络把「谁能连谁」固定成上面的图）。
+- 镜像：
+  - `deploy/Dockerfile`：通用镜像；
+  - `deploy/Dockerfile.launcher`：加 Docker CLI，只有它拿 Docker socket；
+  - `deploy/Dockerfile.investigator`：加 Claude Agent SDK；
+  - `deploy/Dockerfile.worker-ssh`：加 OpenSSH 客户端，给经 SSH 做事的工作画像。
+- 编排：`deploy/compose.yml` 是单机编排，五个网络把「谁能连谁」固定成上面的图；MCP 网关按需打开。
+- `deploy/host/`：一个工作画像只能碰主机的一小块时的做法。
+  - `patrol.py` 只用标准库，把主机的事实快照签名后作为一条信号送进来。快照只有汇总数字，不带这台机器上别的服务的名字。
+  - `airlock-maint` 是工作画像那把 SSH key 在主机上唯一能跑的程序：`authorized_keys` 用 `command=` 把 key 绑到它，它只认三条子命令，每次调用都在主机那边记一行。
 - `python scripts/compose_smoke.py`：按原样起这个 compose（桩引擎、只跑 echo 的工作画像），走一遍"信号 → 容器里的调查员 → 批准 → 启动器在容器里起工作容器 → 记录"，再从调查员容器里验证网络切分，最后全部拆掉。2026-09-23 在本机 Docker（OrbStack）上通过。
 - 容器边界的实测：`AIRLOCK_DOCKER_TESTS=1 pytest tests/test_docker.py`，用工作画像的姿态自检从容器里面逐条证明：非 root、根文件系统只读、无网络、无任何 capability、no-new-privileges、凭证只读、/tmp 不可执行、进程数和内存上限；外加超时、急停、启动器重启后清理在途容器、调查员网络只经代理出网。
 
@@ -156,13 +182,26 @@ CLI 报的 `cost_usd` 是它按自己的价目表估的，续接的会话里还�
 
 Docker 真跑过的（2026-09-23，本机 OrbStack）：容器边界实测、超时/急停/重启清理、出网只经代理、`deploy/compose.yml` 整套起来走通一次（桩引擎）。
 
+在一台 Linux 云服务器上真跑过（2026-09-23，Docker Compose 2.32）：`deploy/compose.yml` 常驻运行，infra 调查员在容器里配真模型，走完了一次完整的巡检流程：
+
+1. `deploy/host/patrol.py` 把主机快照签名送进来。
+2. 调查员出计划：清理悬空镜像，再复查磁盘。
+3. 批准后，启动器起 `host-maint` 工作容器，用那把受限 SSH key 执行。
+4. 执行前，姿态自检先证明这把 key 跑不了别的命令。
+5. 执行后，主机自己的记录里只有两次放行的调用和一次自检被拒。
+6. 控制面账本、启动器记录、每组执行记录的哈希链都完整。
+
+MCP 网关也在那台服务器上接好了，见上文。
+
 真模型跑过的（2026-09-23，经 LiteLLM 用 `gpt-5.6-luna`，Claude Agent SDK 0.2.158 / CLI 2.1.280，受限模式在本机）：`scripts/demo.py --smoke --engine claude` 全流程走通——调查员读证据、经控制面会诊另一个调查员、给出能过校验的计划、按留言修订出新版本、批准后执行；另外单独验证了钩子的拒绝真的挡住 CLI（工作目录外的诱饵文件、`kubectl delete` 都被拒，内容没有到模型那里）。
+
+这台 Mac 上 OrbStack 的容器到模型网关 TLS 握手不通：Mac 本机直连正常，容器连别的站点也正常，本机 hookstack 工作栈的出网代理一样不通。所以容器里配真模型的验证都在云服务器上做。
 
 写了但**没有真跑过**的：
 
-- 容器里的调查员配真模型：镜像和流程都就绪，但这台 Mac 上 OrbStack 容器到模型网关的 TLS 握手不通（Mac 本机直连正常，容器连别的站点正常，本机 hookstack 工作栈的出网代理也一样不通），换一台 Linux 机器或理顺容器网络后再验证。
 - task 模式的工作画像配真模型。
-- 真实凭证的工作画像（等你建专用身份）。
+- 云上的专用身份（AWS、K8s 的工作画像）：等你建身份。真正持有过凭证的工作画像目前只有上面那把受限 SSH key。
+- 对账读真实的 CloudTrail 或 k8s 审计日志：目前只在测试数据上跑过。
 
 MCP 和 skills 已实现并在真 CLI 上验证（见上文）。
 

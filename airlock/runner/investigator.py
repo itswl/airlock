@@ -29,7 +29,8 @@ Configuration is the environment, because a node is a container:
     AIRLOCK_POSTURE_FILE       YAML list of posture checks (see airlock.runner.posture)
     AIRLOCK_MCP_CONFIG         JSON file of MCP servers ({"mcpServers": {...}}), read at the start of every run;
                                outside the working directory, or under its .claude/ (see airlock.runner.mcp)
-    AIRLOCK_MCP_ALLOWED        comma-separated MCP tools this profile may call: mcp__<server>__<tool> or mcp__<server>__*
+    AIRLOCK_MCP_ALLOWED        comma-separated MCP tools this profile may call: mcp__<server>__<tool>, or a
+                               pattern inside one server (mcp__<server>__*, mcp__<server>__get_*)
     AIRLOCK_SKILLS             "all" or comma-separated names; skills live in <workdir>/.claude/skills
     AIRLOCK_MAX_CONCURRENT     investigations at once (default 2)
     AIRLOCK_MODEL              model name for the claude engine

@@ -6,13 +6,15 @@ edit takes effect on the next run without a restart, and it is the only MCP
 configuration the CLI sees (strict): nothing in anybody's settings adds a server.
 
 A configured server does not grant its tools. Each tool the agent may call is
-named in ``AIRLOCK_MCP_ALLOWED`` (``mcp__<server>__<tool>`` or
-``mcp__<server>__*``) and the gate refuses the rest.
+named in ``AIRLOCK_MCP_ALLOWED`` (``mcp__<server>__<tool>``, or a pattern inside
+one server such as ``mcp__<server>__get_*``) and the gate refuses the rest.
 
 What a server can reach is what its credentials can reach, and the agent runs
 as the same user in the same container: it can read those credentials too. So
 an investigator's MCP servers hold read-only credentials, for the same reason
-its shell does. The tool allowlist is a second layer, not the boundary.
+its shell does. The tool allowlist is a second layer, not the boundary. A
+server whose only credential can also write goes behind ``airlock.mcpgate``,
+which holds the credential and forwards only the tools named for it.
 """
 
 from __future__ import annotations

@@ -6,13 +6,14 @@ What it proves, on this machine's Docker:
 
 * the images build (deploy/Dockerfile and deploy/Dockerfile.launcher);
 * the compose file starts: control plane, launcher with the Docker socket,
-  two investigators, the egress proxy, on the four networks;
+  two investigators, the egress proxy and the MCP gateway, on the five networks;
 * a signed signal reaches an investigator in its container, its plan comes back,
   an approval through the console launches a worker container from inside the
   launcher container, and the run's record says isolation: container;
 * the network split holds from inside an investigator: the launcher does not
   even resolve, the internet is unreachable directly, the proxy passes a listed
-  host and refuses an unlisted one.
+  host and refuses an unlisted one; the MCP gateway answers the infra
+  investigator and does not resolve for the code one.
 
 Engines are stubs (no model, no key) and the worker only runs echo. Everything
 lives under data/compose-<time>/ in this checkout and under a compose project
@@ -84,10 +85,19 @@ def proxy(target):
     s.sendall(f"CONNECT {target} HTTP/1.1\\r\\nHost: {target}\\r\\n\\r\\n".encode())
     return s.recv(200).decode(errors="replace").split("\\r\\n")[0]
 import sys
+import urllib.request
+def health(url):
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return opener.open(url, timeout=5).status
+    except OSError as exc:
+        return type(exc).__name__
 print("launcher:", reach("launcher", 8090))
 print("internet:", reach("1.1.1.1", 443))
 print("listed:", proxy(sys.argv[1] + ":443"))
 print("unlisted:", proxy("example.com:443"))
+print("mcp gate:", reach("mcp-gate", 8097))
+print("mcp gate health:", health("http://mcp-gate:8097/healthz"))
 """
 EVIDENCE = {
     "README.md": "Demo environment. demo/api runs 3 pods behind the ops worker. Everything you can look at is here.\n",
@@ -140,6 +150,7 @@ def lay_out(root: Path, port: int, real: dict[str, str] | None = None) -> dict[s
         "creds/investigator-infra",
         "code",
         "profiles/skills-infra",
+        "data/mcp-gate",
     ):
         (root / sub).mkdir(parents=True, exist_ok=True)
         (root / sub).chmod(0o777)  # the containers run as uid 10001
@@ -230,6 +241,13 @@ def lay_out(root: Path, port: int, real: dict[str, str] | None = None) -> dict[s
     (root / "profiles" / "infra.md").write_text(REAL_INSTRUCTIONS if real else "Smoke test profile.\n")
     (root / "profiles" / "posture-infra.yaml").write_text("[]\n")
     (root / "profiles" / "mcp-infra.json").write_text('{"mcpServers": {}}\n')
+    # A gateway in front of a server that is not there: the smoke checks the wiring, scripts/mcpgate_check.py the protocol.
+    gate = {
+        "servers": {"demo": {"url": "http://127.0.0.1:9/mcp", "tools": ["deploy_history"]}},
+        "clients": {"infra": {"token_env": "AIRLOCK_MCPGATE_INFRA_TOKEN", "servers": ["demo"]}},
+    }
+    (root / "mcp-gate.json").write_text(json.dumps(gate))
+    (root / "mcp-gate.env").write_text(f"AIRLOCK_MCPGATE_INFRA_TOKEN={secrets.token_hex(24)}\n")
     (root / "work" / "infra" / "stub-reply.md").write_text(REPLY)
     return secret
 
@@ -282,6 +300,7 @@ def main() -> int:
         **({"AIRLOCK_EGRESS_ALLOW": str(gateway)} if real else {}),
         "AIRLOCK_CONSOLE_PORT": str(port),
         "DOCKER_GID": os.environ.get("DOCKER_GID", "0"),
+        "COMPOSE_PROFILES": "mcp-gate",
     }
     compose = [
         "docker",
@@ -374,6 +393,19 @@ def main() -> int:
         results["network"] = dict(line.split(": ", 1) for line in probe.stdout.strip().splitlines() if ": " in line)
         if probe.returncode != 0:
             results["network_error"] = masked(probe.stderr[-300:])
+        other = run(
+            *compose,
+            "exec",
+            "-T",
+            "investigator-code",
+            "python",
+            "-c",
+            "import socket\ntry:\n socket.getaddrinfo('mcp-gate', 8097); print('reachable')\n"
+            "except socket.gaierror:\n print('does not resolve')",
+            env=env,
+            check=False,
+        )
+        results["code_sees_mcp_gate"] = other.stdout.strip() or masked(other.stderr[-300:])
         if real:
             proxy_log = run(*compose, "logs", "--no-color", "egress", env=env, check=False)
             results["model_calls_through_proxy"] = f"allowed {gateway}:443" in (proxy_log.stdout + proxy_log.stderr)
@@ -388,7 +420,24 @@ def main() -> int:
         logs = run(*compose, "logs", "--no-color", "--tail", "40", env=env, check=False).stdout
         (ROOT / "data" / f"compose-smoke-{tag}.log").write_text(masked(logs))
         run(*compose, "down", "-v", "--remove-orphans", env=env, check=False)
-        subprocess.run(["rm", "-rf", str(root)], check=False)
+        subprocess.run(["rm", "-rf", str(root)], check=False, capture_output=True)
+        if root.exists():
+            # Files the containers wrote belong to their users (uid 10001, root for
+            # mount points); on a Linux host only root can take them away.
+            run(
+                "docker",
+                "run",
+                "--rm",
+                "--user",
+                "0",
+                "-v",
+                f"{root.parent}:/cleanup",
+                "airlock:dev",
+                "rm",
+                "-rf",
+                f"/cleanup/{root.name}",
+                check=False,
+            )
     print(json.dumps(results, indent=2, ensure_ascii=False))
     network = results.get("network", {})
     ok = (
@@ -401,6 +450,9 @@ def main() -> int:
         and network.get("internet") == "unreachable"
         and str(network.get("listed", "")).startswith("HTTP/1.1 200")
         and str(network.get("unlisted", "")).startswith("HTTP/1.1 403")
+        and network.get("mcp gate") == "reachable"
+        and network.get("mcp gate health") == "200"
+        and results.get("code_sees_mcp_gate") == "does not resolve"
     )
     print("compose smoke:", "PASS" if ok else f"FAIL (logs in data/compose-smoke-{tag}.log)")
     return 0 if ok else 1

@@ -8,6 +8,7 @@ hook give the same answer.
 
 from __future__ import annotations
 
+import fnmatch
 import re
 from pathlib import Path
 from typing import Any
@@ -66,13 +67,16 @@ def _shell_writes_protected(command: str, workdir: Path) -> str | None:
 
 
 def mcp_deny_reason(tool_name: str, allowed: frozenset[str]) -> str | None:
+    """Allowed are exact names and patterns inside one server: ``mcp__alerts__*``, ``mcp__alerts__get_*``."""
     if not tool_name.startswith("mcp__"):
         return None
     if tool_name in allowed:
         return None
     parts = tool_name.split("__")
-    if len(parts) >= 3 and f"mcp__{parts[1]}__*" in allowed:
-        return None
+    if len(parts) >= 3:
+        server = f"mcp__{parts[1]}__"
+        if any(e.startswith(server) and "*" in e and fnmatch.fnmatchcase(tool_name, e) for e in allowed):
+            return None
     return (
         f"{tool_name} refused: it is not on this profile's MCP allowlist. Mounting a server does not grant its tools."
     )
