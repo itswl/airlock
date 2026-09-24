@@ -24,6 +24,14 @@ import yaml
 
 VERIFY_KINDS = ("github", "hub-signature", "hmac", "bearer")
 MODES = ("commands", "task")
+# Who approves a plan: you, or for a plan whose every step is on sandbox workers, the sandbox rule
+# (docs/security.md, 4b).
+APPROVALS = ("operator", "sandbox")
+# All a sandbox worker's container is told, besides airlock's own variables: where its proxy is, and its locale.
+SANDBOX_ENV = frozenset(
+    {"HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy", "TZ", "LANG", "LC_ALL"}
+)
+SANDBOX_RUNS_PER_DAY = 10
 
 
 class ConfigError(ValueError):
@@ -79,6 +87,12 @@ class WorkerProfile:
     run gets a fresh clone of that repository with no remote, and the launcher
     keeps what changed (airlock.launcher.workspace). ``instructions`` is added to
     every task step's prompt: the operator's rules for this worker, not the plan's.
+
+    ``approval: sandbox`` lets the sandbox rule approve a plan whose every step
+    runs on sandbox workers, at most ``sandbox_runs_per_day`` times in 24 hours
+    per worker. Only a worker that can reach nothing but its fresh clone and its
+    model may say so: what the profile shows is checked here, and the launcher
+    checks the rest before each run (airlock.launcher.sandbox).
     """
 
     name: str
@@ -97,6 +111,8 @@ class WorkerProfile:
     pids: int = 256
     timeout_seconds: int = 1800
     user: str | None = None
+    approval: str = "operator"
+    sandbox_runs_per_day: int = 0
 
     def allows_command(self, text: str) -> bool:
         return any(re.fullmatch(pattern, text) for pattern in self.command_allowlist)
@@ -226,6 +242,20 @@ def _workers(raw: list[Mapping[str, Any]]) -> dict[str, WorkerProfile]:
             raise ConfigError(
                 f"worker {name}: workspace_dir and repos are two answers to one question; a worker has one of them"
             )
+        env = {str(k): str(v) for k, v in (item.get("env") or {}).items()}
+        approval = str(item.get("approval") or "operator")
+        if approval not in APPROVALS:
+            raise ConfigError(f"worker {name}: approval must be one of {APPROVALS}")
+        runs_per_day = 0
+        if approval == "sandbox":
+            _sandbox_shape(name, repos, env, item.get("network"))
+            runs_per_day = int(item.get("sandbox_runs_per_day", SANDBOX_RUNS_PER_DAY))
+            if not 1 <= runs_per_day <= 1000:
+                raise ConfigError(f"worker {name}: sandbox_runs_per_day must be between 1 and 1000")
+        elif item.get("sandbox_runs_per_day") is not None:
+            raise ConfigError(
+                f"worker {name}: sandbox_runs_per_day is for approval: sandbox; this worker's plans are yours"
+            )
         result[name] = WorkerProfile(
             name=name,
             modes=modes,
@@ -237,14 +267,34 @@ def _workers(raw: list[Mapping[str, Any]]) -> dict[str, WorkerProfile]:
             repos={str(k): str(v) for k, v in repos.items()},
             instructions=str(item.get("instructions") or ""),
             network=item.get("network"),
-            env={str(k): str(v) for k, v in (item.get("env") or {}).items()},
+            env=env,
             posture_checks=checks,
             memory=str(item.get("memory") or "1g"),
             pids=int(item.get("pids") or 256),
             timeout_seconds=int(item.get("timeout_seconds") or 1800),
             user=str(item["user"]) if item.get("user") else None,
+            approval=approval,
+            sandbox_runs_per_day=runs_per_day,
         )
     return result
+
+
+def _sandbox_shape(name: str, repos: Mapping[str, Any], env: Mapping[str, str], network: Any) -> None:
+    """What makes a worker a sandbox, as far as its profile can show it: a fresh clone to work in, no key to hand."""
+    if not repos:
+        raise ConfigError(
+            f"worker {name}: approval: sandbox needs repos; a sandbox worker works only in a fresh clone, with no remote"
+        )
+    for key, value in env.items():
+        if key not in SANDBOX_ENV:
+            raise ConfigError(
+                f"worker {name}: env {key} could carry a credential; a sandbox worker is told only where its proxy "
+                "is and its locale (its model settings go in engine.env, which the launcher checks)"
+            )
+        if "@" in value:
+            raise ConfigError(f"worker {name}: env {key} has credentials in it")
+    if str(network or "none") in ("host", "bridge"):
+        raise ConfigError(f"worker {name}: a sandbox worker's network is none or an internal one, not {network}")
 
 
 def load_control(source: str | Path | Mapping[str, Any], env: Mapping[str, str] | None = None) -> ControlConfig:

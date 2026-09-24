@@ -11,6 +11,10 @@ starts, it checks on its own:
   a control plane that has been talked into something still cannot start a
   worker outside that list, with a command outside its allowlist, or with a
   permission the profile may not have;
+* an approval the sandbox rule granted, not you, is honoured only if every
+  worker in the plan is a sandbox worker in those same profiles, passes the
+  checks of airlock.launcher.sandbox, and has allowance left on the
+  launcher's own count of what it ran on the rule's word;
 * no other running plan holds any of its targets.
 
 The record of a run lives here, outside every container: the launcher's own
@@ -37,8 +41,18 @@ from airlock.control.service import Outcome
 from airlock.crypto import canonical_json, sign
 from airlock.db import Database
 from airlock.launcher.runtime import GroupSpec, Runtime
+from airlock.launcher.sandbox import credentials_problem
 from airlock.launcher.workspace import Prepared, WorkspaceError, changes, prepare, repo_of
-from airlock.plans import PlanError, groups, parse_plan, plan_hash, targets, validate_plan
+from airlock.plans import (
+    SANDBOX_APPROVER,
+    PlanError,
+    groups,
+    parse_plan,
+    plan_hash,
+    targets,
+    validate_plan,
+    workers_of,
+)
 from airlock.runner.executor import AUDIT_PREFIX, RESULT_PREFIX
 from airlock.runner.recorder import Recorder, verify_lines
 
@@ -60,7 +74,14 @@ CREATE TABLE IF NOT EXISTS launches (
     reported INTEGER NOT NULL DEFAULT 0,
     report_attempts INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS sandbox_launches (
+    approval_id TEXT NOT NULL,
+    worker TEXT NOT NULL,
+    at REAL NOT NULL,
+    PRIMARY KEY (approval_id, worker)
+);
 """
+SANDBOX_WINDOW_SECONDS = 86400
 
 # Which executor lines the control plane hears about as they happen.
 FORWARDED = frozenset(
@@ -102,6 +123,18 @@ class Launcher:
         self.current: dict[str, str] = {}
         self.cancelled: set[str] = set()
         self.tasks: dict[str, asyncio.Task[None]] = {}
+        # Per sandbox worker, what its network reaches beyond its own (None: nothing), from inspect_sandbox().
+        self.sandbox_networks: dict[str, str | None] = {}
+
+    async def inspect_sandbox(self) -> dict[str, str | None]:
+        """At start: whether each sandbox worker's network is one the rule may run on (airlock.launcher.sandbox)."""
+        for worker in self.config.workers.values():
+            if worker.approval == "sandbox":
+                problem = await self.runtime.network_problem(worker.network)
+                self.sandbox_networks[worker.name] = problem
+                if problem:
+                    logger.warning("sandbox worker %s: %s; its plans will need your approval", worker.name, problem)
+        return dict(self.sandbox_networks)
 
     # ------------------------------------------------------------------ accept
 
@@ -128,6 +161,9 @@ class Launcher:
             return self._refuse(
                 approval, "the launcher's own worker profiles do not allow this plan: " + "; ".join(errors), errors
             )
+        refusal = self._standing_refusal(approval, plan)
+        if refusal:
+            return self._refuse(approval, refusal)
         busy = sorted({self.locks[t] for t in targets(plan) if t in self.locks})
         if busy:
             held = [t for t in targets(plan) if t in self.locks]
@@ -136,6 +172,12 @@ class Launcher:
             "INSERT INTO launches (approval_id, work_id, plan_hash, received_at, status) VALUES (?,?,?,?,?)",
             [approval_id, str(approval.get("work_id") or ""), digest, self.clock(), "running"],
         )
+        if approval.get("approver") == SANDBOX_APPROVER:
+            for name in workers_of(plan):
+                self.db.execute(
+                    "INSERT OR IGNORE INTO sandbox_launches (approval_id, worker, at) VALUES (?,?,?)",
+                    [approval_id, name, self.clock()],
+                )
         for target in targets(plan):
             self.locks[target] = approval_id
         run_dir = self.runs_dir / approval_id
@@ -148,6 +190,35 @@ class Launcher:
         record.write("launch.accepted", approval=approval, plan_hash=digest, isolation=self.runtime.isolation)
         self.tasks[approval_id] = asyncio.create_task(self._run(approval, plan, record))
         return Outcome(202, {"status": "accepted"})
+
+    def _standing_refusal(self, approval: Mapping[str, Any], plan: Any) -> str | None:
+        """Why this launcher will not run a plan on the sandbox rule's approval, or None. Yours pass untouched."""
+        approver = str(approval.get("approver") or "")
+        if not approver.startswith("policy:"):
+            return None
+        if approver != SANDBOX_APPROVER:
+            return f"the approval names a rule this launcher does not know: {approver}"
+        if self.runtime.isolation != "container":
+            return "the sandbox rule's approvals run only in containers, and this launcher's runtime isolates nothing"
+        since = self.clock() - SANDBOX_WINDOW_SECONDS
+        for name in workers_of(plan):
+            worker = self.config.workers[name]
+            if worker.approval != "sandbox":
+                return f"worker {name} is not a sandbox worker in the launcher's own profiles; its plans need your approval"
+            if name not in self.sandbox_networks:
+                return f"worker {name}'s network was not inspected when the launcher started"
+            problem = self.sandbox_networks[name] or credentials_problem(worker.credentials_dir)
+            if problem:
+                return f"worker {name} is marked sandbox, but {problem}"
+            row = self.db.one(
+                "SELECT COUNT(*) AS n FROM sandbox_launches WHERE worker = ? AND at >= ?", [name, since]
+            ) or {"n": 0}
+            if int(row["n"]) >= worker.sandbox_runs_per_day:
+                return (
+                    f"worker {name} has run {row['n']} times on the sandbox rule in 24 hours, "
+                    f"its allowance is {worker.sandbox_runs_per_day}"
+                )
+        return None
 
     def _refuse(self, approval: Mapping[str, Any], reason: str, errors: list[str] | None = None) -> Outcome:
         """A refusal is part of the record too: which approval, and why nothing started."""

@@ -229,6 +229,14 @@ def _workers_section(workers: list[Mapping[str, Any]]) -> str:
             lines.append(f"  - command must fully match: `{pattern}`")
         if w.get("allowed_permissions"):
             lines.append(f"  - may be granted: {', '.join(w['allowed_permissions'])}")
+        if w.get("repos"):
+            lines.append(f"  - a step's target is one of: {', '.join('repo:' + r for r in w['repos'])}")
+        if w.get("approval") == "sandbox":
+            lines.append(
+                "  - a sandbox worker: a plan whose every step is on sandbox workers runs at once, in a fresh clone, "
+                "and its diff is reviewed afterwards; one step on any other worker in the same plan makes the whole "
+                "plan wait for approval"
+            )
     return "\n".join(lines)
 
 

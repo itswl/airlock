@@ -123,6 +123,8 @@ class Runtime(Protocol):
 
     async def kill_approval(self, approval_id: str) -> None: ...
 
+    async def network_problem(self, network: str | None) -> str | None: ...
+
 
 LINE_LIMIT = 2**20
 
@@ -262,6 +264,37 @@ class DockerRuntime:
         for container in out.decode().split():
             await self.kill(container)
 
+    async def network_problem(self, network: str | None) -> str | None:
+        """Why a container on ``network`` reaches more than the other containers there, or None.
+
+        ``none`` reaches nothing. An internal Docker network has no route out: what
+        a container on it reaches beyond its neighbours is what the egress proxy on
+        that network lets through.
+        """
+        if not network or network == "none":
+            return None
+        process = await asyncio.create_subprocess_exec(
+            self.docker_bin,
+            "network",
+            "inspect",
+            "--format",
+            "{{.Internal}}",
+            network,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            out, _ = await asyncio.wait_for(process.communicate(), timeout=30)
+        except TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            return f"its network {network} could not be inspected in time"
+        if process.returncode != 0:
+            return f"its network {network} could not be inspected; does it exist?"
+        if out.decode().strip() != "true":
+            return f"its network {network} is not internal, so it reaches more than the egress proxy lets through"
+        return None
+
 
 class LocalRuntime:
     """The executor as a plain child process. No isolation at all: tests and the demo only."""
@@ -307,3 +340,6 @@ class LocalRuntime:
     async def kill_approval(self, approval_id: str) -> None:
         for name in [n for n in self.processes if n.startswith(f"airlock-{approval_id}-")]:
             await self.kill(name)
+
+    async def network_problem(self, network: str | None) -> str | None:
+        return "the local runtime has no networks: a group reaches whatever this machine reaches"

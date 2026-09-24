@@ -2,7 +2,7 @@
 {% block title %}报表 · airlock{% endblock %}
 {% block body %}
 <h1>报表 <span class="small muted">最近 {{ report.window.days }} 天 · <a href="/report?days=7">7 天</a> · <a href="/report?days=30">30 天</a> · <a href="/report.json?days={{ report.window.days }}">JSON</a></span></h1>
-<p class="muted small">你说的（评价）和你做的（结果）分开算。结果不用你点：方案被批准并执行成功，是报告帮上忙最硬的证据。报表只读，不参与任何决定。</p>
+<p class="muted small">你说的（评价）和你做的（结果）分开算。结果不用你点：方案被你批准并执行成功，是报告帮上忙最硬的证据。沙箱规则替你批准的运行单独算，没人选过它，有没有用看你的评价。报表只读，不参与任何决定。</p>
 
 <div class="card">
   <h3 style="margin-top:0">工作项 {{ report.work_items }} 个</h3>
@@ -23,7 +23,7 @@
     <tr><td>token</td><td class="small">{% for k, v in report.investigations.tokens.items() %}{{ k }} {{ v }}{% if not loop.last %} · {% endif %}{% endfor %}</td></tr>
     <tr><td>守卫拒绝</td><td>{{ report.investigations.refusals }} 次</td></tr>
     <tr><td>出了方案的工作项</td><td>{{ report.plans.items_with_plan }}（第一版就通过校验 {{ report.plans.first_plan_valid }}，平均 {{ report.plans.average_versions if report.plans.average_versions is not none else "—" }} 版）</td></tr>
-    <tr><td>批准前等待中位数</td><td>{{ report.approvals.median_wait_minutes if report.approvals.median_wait_minutes is not none else "—" }} 分钟（{{ report.approvals.count }} 次批准）</td></tr>
+    <tr><td>批准前等待中位数</td><td>{{ report.approvals.median_wait_minutes if report.approvals.median_wait_minutes is not none else "—" }} 分钟（你批准了 {{ report.approvals.count }} 次{% if report.approvals.by_rule %}；另有 {{ report.approvals.by_rule }} 次由沙箱规则批准，不算在内{% endif %}）</td></tr>
     <tr><td>执行</td><td>{% for k, v in report.runs.items() %}{{ k }} {{ v }}{% if not loop.last %} · {% endif %}{% else %}—{% endfor %}</td></tr>
   </table>
 </div>

@@ -36,6 +36,13 @@ three variables, handed to it as `engine.env` in its credentials directory),
 reaches the model only through the proxy, and commits in a fresh clone. The
 smoke checks that the change the launcher computed outside the container is
 the fix, and that the repository it was cloned from did not move.
+
+    python scripts/compose_smoke.py --sandbox
+
+is ``--code`` with the code worker marked ``approval: sandbox``: nobody clicks.
+The smoke checks that the plan ran on the sandbox rule's approval, that the
+launcher inspected the worker's network on this Docker and found it internal,
+and the same things about the change as ``--code``.
 """
 
 from __future__ import annotations
@@ -186,10 +193,13 @@ def demo_repo(path: Path) -> str:
     return subprocess.run(["git", "rev-parse", "HEAD"], cwd=path, capture_output=True, text=True).stdout.strip()
 
 
-def lay_out(root: Path, port: int, real: dict[str, str] | None = None, *, code: str | None = None) -> dict[str, str]:
+def lay_out(
+    root: Path, port: int, real: dict[str, str] | None = None, *, code: str | None = None, sandbox: bool = False
+) -> dict[str, str]:
     """Every file and directory the compose file refers to, with fresh secrets.
 
-    ``code`` is the compose project name when the plan is a code worker's task step.
+    ``code`` is the compose project name when the plan is a code worker's task step;
+    ``sandbox`` marks that worker ``approval: sandbox``.
     """
     names = ("SESSION", "LAUNCHER", "ALERTS", "INFRA", "CODE")
     secret = {name: secrets.token_hex(24) for name in names}
@@ -272,6 +282,7 @@ def lay_out(root: Path, port: int, real: dict[str, str] | None = None, *, code: 
                 "memory": "2g",
                 "pids": 512,
                 "timeout_seconds": 900,
+                **({"approval": "sandbox", "sandbox_runs_per_day": 1} if sandbox else {}),
             }
         )
         model = real["AIRLOCK_MODEL"]
@@ -362,7 +373,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--engine", choices=("stub", "claude"), default="stub")
     parser.add_argument("--code", action="store_true", help="a code worker changes a made-up repository, real model")
+    parser.add_argument("--sandbox", action="store_true", help="--code, approved by the sandbox rule: nobody clicks")
     args = parser.parse_args()
+    args.code = args.code or args.sandbox
     real = None
     if args.engine == "claude" or args.code:
         names = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "AIRLOCK_MODEL")
@@ -431,7 +444,7 @@ def main() -> int:
             str(ROOT),
         )
     root.mkdir(parents=True)
-    secret = lay_out(root, port, real, code=project if args.code else None)
+    secret = lay_out(root, port, real, code=project if args.code else None, sandbox=args.sandbox)
     results: dict[str, Any] = {}
     try:
         print(f"starting compose project {project}")
@@ -445,24 +458,35 @@ def main() -> int:
             "work_id"
         ]
         db = root / "data" / "control.db"
-        wait_for(lambda: state_of(db, work_id) == "plan_ready", "the investigator's plan", within=600 if real else 120)
-        with httpx.Client(base_url=base, follow_redirects=False) as web:
-            web.post("/login", data={"password": PASSWORD})
-            page = web.get(f"/work/{work_id}").text
-            fields = {
-                name: re.search(rf'name="{name}" value="([^"]+)"', page).group(1)
-                for name in ("csrf", "version", "plan_hash")
-            }  # type: ignore[union-attr]
-            web.post(f"/work/{work_id}/approve", data=fields)
+        if args.sandbox:  # nobody clicks: the rule approves as the plan arrives
+            wait_for(
+                lambda: state_of(db, work_id) in ("approved", "running", "done", "failed", "refused"),
+                "the sandbox rule's approval",
+                within=120,
+            )
+        else:
+            wait_for(
+                lambda: state_of(db, work_id) == "plan_ready", "the investigator's plan", within=600 if real else 120
+            )
+            with httpx.Client(base_url=base, follow_redirects=False) as web:
+                web.post("/login", data={"password": PASSWORD})
+                page = web.get(f"/work/{work_id}").text
+                fields = {
+                    name: re.search(rf'name="{name}" value="([^"]+)"', page).group(1)
+                    for name in ("csrf", "version", "plan_hash")
+                }  # type: ignore[union-attr]
+                web.post(f"/work/{work_id}/approve", data=fields)
         final = wait_for(
             lambda: (s := state_of(db, work_id)) in ("done", "failed", "refused") and s,
             "the run",
             within=900 if args.code else 180,
         )
         with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
-            approval, result = conn.execute(
-                "SELECT approval_id, result FROM runs WHERE work_id = ?", [work_id]
-            ).fetchone()
+            found = conn.execute("SELECT approval_id, result FROM runs WHERE work_id = ?", [work_id]).fetchone()
+            note = conn.execute("SELECT note FROM work_items WHERE id = ?", [work_id]).fetchone()[0]
+        if found is None:  # refused before anything ran: the reason is the work item's note
+            raise RuntimeError(f"the work item ended {final} without a run: {masked(str(note))}")
+        approval, result = found
         report = json.loads(result)
         log = root / "runs" / approval / "group-1" / "step-1.log"
         results = {
@@ -471,6 +495,29 @@ def main() -> int:
             "record_intact": all(g.get("record_intact") for g in report.get("groups") or []),
             "worker_output": log.read_text().strip() if log.exists() else None,
         }
+        if args.sandbox:
+            with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+                approver, via = conn.execute("SELECT approver, via FROM approvals WHERE id = ?", [approval]).fetchone()
+            seen = json.loads((root / "runs" / approval / "approval.json").read_text())
+            health = run(
+                *compose,
+                "exec",
+                "-T",
+                "launcher",
+                "python",
+                "-c",
+                "import json, urllib.request\n"
+                "opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))\n"
+                "print(json.dumps(json.load(opener.open('http://127.0.0.1:8090/healthz'))['sandbox_networks']))",
+                env=env,
+                check=False,
+            )
+            results["sandbox"] = {
+                "approver": approver,
+                "via": via,
+                "launcher_saw": seen.get("approver"),
+                "networks": json.loads(health.stdout) if health.returncode == 0 else masked(health.stderr[-300:]),
+            }
         probe = run(
             *compose,
             "exec",
@@ -560,6 +607,16 @@ def main() -> int:
         and (
             not args.code
             or all(results.get("code", {}).get(k) for k in ("fix_in_the_diff", "test_in_the_diff", "mirror_unchanged"))
+        )
+        and (
+            not args.sandbox
+            or results.get("sandbox", {})
+            == {
+                "approver": "policy:sandbox",
+                "via": "rule",
+                "launcher_saw": "policy:sandbox",
+                "networks": {"code": "ok"},
+            }
         )
         and network.get("launcher") == "does not resolve"
         and network.get("internet") == "unreachable"

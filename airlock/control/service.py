@@ -18,6 +18,13 @@ to "is there any way around your approval":
 * only the plan version you approved, identified by its hash, is handed on;
 * only the investigator that owns a work item can consult another, one level deep;
 * nothing here can start a worker. It can only ask the launcher, which checks again.
+
+One kind of approval is not your click. A plan whose every step runs on workers
+marked ``approval: sandbox`` is approved by the sandbox rule: once per version,
+within each worker's daily allowance. It is an approval like yours, bound to the
+version and the hash, single use, expiring, and in the ledger with the rule as
+its actor; and the launcher checks from its own side that every worker in the
+plan reaches nothing but a fresh clone and its model (airlock.launcher.sandbox).
 """
 
 from __future__ import annotations
@@ -29,6 +36,7 @@ import re
 import secrets
 import time
 import uuid
+from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,11 +52,22 @@ from airlock.control.store import ACTIONS, CONCLUDED, REOPENS, SCHEMA, TERMINAL
 from airlock.crypto import PROFILE_HEADER, SignatureError, canonical_json, sha256_hex, sign
 from airlock.db import Database
 from airlock.ledger import Ledger
-from airlock.plans import PlanError, extract_plan, has_plan, plan_hash, strip_plans, validate_plan
+from airlock.plans import (
+    SANDBOX_APPROVER,
+    PlanError,
+    extract_plan,
+    has_plan,
+    plan_hash,
+    sandbox_plan,
+    strip_plans,
+    validate_plan,
+    workers_of,
+)
 from airlock.runner.gate import redact
 
 logger = logging.getLogger("airlock.control")
 RATINGS = ("useful", "useless")
+SANDBOX_WINDOW_SECONDS = 86400
 
 DISPATCH_BACKOFF_SECONDS = (5, 15, 60, 180, 600)
 LAUNCH_RETRY_SECONDS = 30
@@ -77,6 +96,11 @@ def lead_of(prose: str, limit: int = 500) -> str:
         clean, _ = redact(re.sub(r"^#+\s*", "", text))
         return clean[:limit]
     return ""
+
+
+def _by_rule(approver: str) -> dict[str, str]:
+    """What a notification says about who approved: a rule's name when a rule did, never yours."""
+    return {"approved_by": approver} if approver.startswith("policy:") else {}
 
 
 def _workspace_summary(workspace: Mapping[str, Any]) -> dict[str, Any]:
@@ -356,6 +380,8 @@ class ControlPlane:
                     "modes": list(w.modes),
                     "command_allowlist": list(w.command_allowlist),
                     "allowed_permissions": list(w.allowed_permissions),
+                    "repos": sorted(w.repos),
+                    "approval": w.approval,
                 }
                 for w in self.config.workers.values()
             ],
@@ -582,6 +608,9 @@ class ControlPlane:
         )
         state = self._settle({**work, "current_version": version}, "plan_ready")
         if state == "plan_ready":
+            rule = self._sandbox_rule(work["id"], version, digest, plan)
+            if rule.get("approved_by"):
+                state = "approved"
             self._notify(
                 "plan.revised" if current is not None and changed else "plan.ready",
                 work["id"],
@@ -591,8 +620,52 @@ class ControlPlane:
                 risk=plan.risk,
                 changed=changed,
                 lead=lead,
+                **rule,
             )
         return Outcome(200, {"status": state, "version": version})
+
+    def _sandbox_rule(self, work_id: str, version: int, digest: str, plan: Any) -> dict[str, Any]:
+        """Approve a plan that runs only on sandbox workers: once per version, within each worker's allowance.
+
+        Returns what the plan's notification says about it: nothing when the rule
+        does not apply, who approved when it did, and why not when it declined.
+        """
+        if not sandbox_plan(plan, self.config.workers):
+            return {}
+        if self.db.one(
+            "SELECT 1 FROM approvals WHERE work_id = ? AND version = ? AND approver = ?",
+            [work_id, version, SANDBOX_APPROVER],
+        ):
+            # The same plan again (an answer that repeats it): running it twice is your call.
+            return {"rule_declined": "approved_once"}
+        used = self._sandbox_approvals(self.clock() - SANDBOX_WINDOW_SECONDS)
+        for name in workers_of(plan):
+            limit = self.config.workers[name].sandbox_runs_per_day
+            if used[name] >= limit:
+                self._set(
+                    work_id, note=f"worker {name} has had its {limit} sandbox approvals of the last 24 hours; yours now"
+                )
+                self.ledger.append(
+                    "approval.rule_declined",
+                    work_id=work_id,
+                    actor=SANDBOX_APPROVER,
+                    data={"version": version, "plan_hash": digest, "worker": name, "used": used[name], "limit": limit},
+                )
+                return {"rule_declined": "allowance", "allowance": {"worker": name, "used": used[name], "limit": limit}}
+        granted = self._approve(work_id, version=version, plan_hash_value=digest, approver=SANDBOX_APPROVER, via="rule")
+        return {"approved_by": SANDBOX_APPROVER} if granted.ok else {}
+
+    def _sandbox_approvals(self, since: float) -> Counter[str]:
+        """Plans the sandbox rule approved since ``since``, per worker: what an allowance is measured against."""
+        used: Counter[str] = Counter()
+        rows = self.db.all(
+            "SELECT p.plan FROM approvals a JOIN plans p ON p.work_id = a.work_id AND p.version = a.version "
+            "WHERE a.approver = ? AND a.at >= ?",
+            [SANDBOX_APPROVER, since],
+        )
+        for row in rows:
+            used.update({str(step.get("worker")) for step in json.loads(row["plan"]).get("steps") or []})
+        return used
 
     def receive_error(self, profile: str, payload: Mapping[str, Any]) -> Outcome:
         work, refused = self._owned_investigation(profile, payload.get("work_id"))
@@ -702,6 +775,10 @@ class ControlPlane:
 
     def approve(self, work_id: str, *, version: int, plan_hash_value: str, via: str) -> Outcome:
         """Your one click. It names the version and hash you read; anything else is refused."""
+        return self._approve(work_id, version=version, plan_hash_value=plan_hash_value, approver=self.operator, via=via)
+
+    def _approve(self, work_id: str, *, version: int, plan_hash_value: str, approver: str, via: str) -> Outcome:
+        """An approval of one version and hash, by you or by the sandbox rule; the checks are the same for both."""
         work = self.work(work_id)
         if work is None:
             return Outcome(404, {"reason": "no such work item"})
@@ -719,13 +796,13 @@ class ControlPlane:
         self.db.execute(
             "INSERT INTO approvals (id, work_id, version, plan_hash, approver, via, at, expires_at, status) "
             "VALUES (?,?,?,?,?,?,?,?,?)",
-            [approval_id, work_id, int(version), plan_hash_value, self.operator, via, now, expires_at, "approved"],
+            [approval_id, work_id, int(version), plan_hash_value, approver, via, now, expires_at, "approved"],
         )
         self._set(work_id, state="approved", note="")
         self.ledger.append(
             "approval.granted",
             work_id=work_id,
-            actor=self.operator,
+            actor=approver,
             data={
                 "approval": approval_id,
                 "version": int(version),
@@ -734,7 +811,9 @@ class ControlPlane:
                 "expires_at": expires_at,
             },
         )
-        self._notify("work.approved", work_id, version=int(version), plan_hash=plan_hash_value, via=via)
+        self._notify(
+            "work.approved", work_id, version=int(version), plan_hash=plan_hash_value, via=via, **_by_rule(approver)
+        )
         return Outcome(200, {"status": "approved", "approval_id": approval_id})
 
     def reject(self, work_id: str, *, via: str, reason: str = "") -> Outcome:
@@ -1004,7 +1083,7 @@ class ControlPlane:
             self.db.execute("UPDATE approvals SET status = 'launched', note = '' WHERE id = ?", [approval_id])
             self._set(approval["work_id"], state="running", note="")
             self.ledger.append("run.launched", work_id=approval["work_id"], data={"approval": approval_id})
-            self._notify("run.started", approval["work_id"], approval_id=approval_id)
+            self._notify("run.started", approval["work_id"], approval_id=approval_id, **_by_rule(approval["approver"]))
         elif response.status_code == 409 and reason.startswith("busy"):
             self._retry_launch(approval, reason)
         else:
@@ -1025,7 +1104,13 @@ class ControlPlane:
         self.ledger.append(
             "run.refused", work_id=approval["work_id"], data={"approval": approval["id"], "reason": reason[:500]}
         )
-        self._notify("run.refused", approval["work_id"], approval_id=approval["id"], reason=reason[:500])
+        self._notify(
+            "run.refused",
+            approval["work_id"],
+            approval_id=approval["id"],
+            reason=reason[:500],
+            **_by_rule(approval["approver"]),
+        )
 
     def _launched(self, payload: Mapping[str, Any]) -> tuple[dict[str, Any] | None, Outcome | None]:
         approval = self.db.one("SELECT * FROM approvals WHERE id = ?", [str(payload.get("approval_id") or "")])
@@ -1128,6 +1213,7 @@ class ControlPlane:
             approval_id=approval["id"],
             status=status,
             groups=groups,
+            **_by_rule(approval["approver"]),
         )
         self.checkpoint(work_id=approval["work_id"])
         return Outcome(200, {"status": "recorded"})

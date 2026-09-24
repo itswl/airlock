@@ -9,7 +9,12 @@ must keep that true. Before you touch anything, know which side you are on.
 - **The skeleton is fixed.** signal → one investigator → plan → one approval →
   launcher → workers → record. Configuration may add sources, routes and
   profiles; it may not add a path around the approval. A feature that needs
-  one is the wrong feature.
+  one is the wrong feature. The sandbox rule (`approval: sandbox`) is not a
+  path around it: it grants an approval like yours (version and hash, single
+  use, expiring, in the ledger with `policy:sandbox` as the actor), and the
+  launcher re-checks from its own side that every worker in the plan reaches
+  nothing but a fresh clone and its model (`airlock/launcher/sandbox.py`).
+  Widening what the rule may cover is a security change; review it as one.
 - **The launcher trusts nothing it can check itself.** Any change to what the
   control plane sends must keep the launcher re-checking hash, expiry, single
   use and its own worker profiles. Never make the launcher accept a plan the
@@ -39,10 +44,12 @@ must keep that true. Before you touch anything, know which side you are on.
   in front of a real server (`scripts/mcpgate_check.py` for the protocol), and
   one worker holding a real credential: the forced-command SSH key of
   `deploy/host/`. A task-mode worker has run a real model in its container
-  and changed a repository (`scripts/compose_smoke.py --code`, on DeepSeek).
+  and changed a repository (`scripts/compose_smoke.py --code`, on DeepSeek),
+  also on the sandbox rule's approval with nobody clicking (`--sandbox`).
   The extras have run together in compose with a real model on a made-up chat
-  (`scripts/extras_smoke.py`); a real Feishu application, a real chat platform
-  and a real Jira have not. Cloud identities (AWS, K8s) have not run. A change
+  (`scripts/extras_smoke.py`), and since 2026-09-24 they run on one laptop
+  against a real Feishu application, a real chat platform and a real Jira.
+  Cloud identities (AWS, K8s) have not run. A change
   there is not verified until it has run for real, and a PR says which.
 - **A real model reads nothing it should not send.** Outside a container a real
   engine runs confined, in a working directory outside every repository, with

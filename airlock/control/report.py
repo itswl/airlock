@@ -13,6 +13,10 @@ hookstack learned the second half the hard way. Nobody pressed the rating
 buttons on its cards, so a report built only on ratings would have measured
 nothing for months.
 
+A run the sandbox rule approved is kept apart from the ones you approved.
+Nobody chose it, so its outcome says only that it ran; whether the diff was
+worth it is your rating.
+
 Nothing here decides anything. The report reads; approval and budgets never
 look at it.
 """
@@ -29,6 +33,8 @@ from airlock.db import Database
 OUTCOMES = {
     "acted_on": "已执行成功",
     "acted_on_failed": "执行未成功",
+    "ran_in_sandbox": "规则批准，沙箱里跑完",
+    "sandbox_failed": "规则批准，沙箱里没跑成",
     "rejected": "方案被驳回",
     "approval_lapsed": "批准过期或撤回",
     "awaiting_you": "等你批准",
@@ -41,11 +47,22 @@ _OPEN = ("queued", "investigating", "approved", "running")
 _ANSWERS = ("investigation.answered", "plan.ready", "plan.revised", "plan.invalid")
 
 
-def outcome(state: str, runs: list[str], approvals: list[str], operator_messages: int) -> str:
-    if "done" in runs:
+def by_rule(approver: str) -> bool:
+    return approver.startswith("policy:")
+
+
+def outcome(state: str, runs: list[tuple[str, str]], approvals: list[str], operator_messages: int) -> str:
+    """``runs`` is (status, approver) for each run: one the sandbox rule approved is not something you did."""
+    yours = [status for status, approver in runs if not by_rule(approver)]
+    ruled = [status for status, approver in runs if by_rule(approver)]
+    if "done" in yours:
         return "acted_on"
-    if runs:
+    if yours:
         return "acted_on_failed"
+    if "done" in ruled:
+        return "ran_in_sandbox"
+    if ruled:
+        return "sandbox_failed"
     if state == "rejected":
         return "rejected"
     if any(a in ("expired", "revoked") for a in approvals):
@@ -76,8 +93,11 @@ def build_report(db: Database, operator: str, *, days: int, now: float) -> dict[
         return out
 
     plans = grouped("SELECT work_id, version, errors FROM plans WHERE work_id IN ({marks}) ORDER BY version")
-    approvals = grouped("SELECT work_id, status, version, at FROM approvals WHERE work_id IN ({marks})")
-    runs = grouped("SELECT work_id, status FROM runs WHERE work_id IN ({marks})")
+    approvals = grouped("SELECT work_id, status, version, at, approver FROM approvals WHERE work_id IN ({marks})")
+    runs = grouped(
+        "SELECT r.work_id, r.status, a.approver FROM runs r JOIN approvals a ON a.id = r.approval_id "
+        "WHERE r.work_id IN ({marks})"
+    )
     ratings = {r["work_id"]: r for r in db.all(f"SELECT * FROM ratings WHERE work_id IN ({marks})", ids)}  # noqa: S608
     said = Counter(
         r["work_id"]
@@ -120,13 +140,13 @@ def build_report(db: Database, operator: str, *, days: int, now: float) -> dict[
                 if entry["kind"] in ("plan.ready", "plan.revised") and data.get("version"):
                     ready_at.setdefault(int(data["version"]), entry["ts"])
         for approval in approvals.get(work_id, []):
-            if approval["version"] in ready_at:
+            if approval["version"] in ready_at and not by_rule(approval["approver"]):
                 waits.append(approval["at"] - ready_at[approval["version"]])
         versions = plans.get(work_id, [])
         rating = ratings.get(work_id)
         result = outcome(
             item["state"],
-            [r["status"] for r in runs.get(work_id, [])],
+            [(r["status"], r["approver"]) for r in runs.get(work_id, [])],
             [a["status"] for a in approvals.get(work_id, [])],
             said.get(work_id, 0),
         )
@@ -162,7 +182,11 @@ def build_report(db: Database, operator: str, *, days: int, now: float) -> dict[
             "first_plan_valid": sum(1 for r in with_plan if r["first_plan_valid"]),
             "average_versions": round(sum(r["versions"] for r in with_plan) / len(with_plan), 2) if with_plan else None,
         },
-        "approvals": {"median_wait_minutes": _median_minutes(waits), "count": len(waits)},
+        "approvals": {
+            "median_wait_minutes": _median_minutes(waits),
+            "count": len(waits),
+            "by_rule": sum(1 for rows in approvals.values() for a in rows if by_rule(a["approver"])),
+        },
         "runs": dict(Counter(r["status"] for rs in runs.values() for r in rs)),
         "investigations": {
             "rounds": rounds,

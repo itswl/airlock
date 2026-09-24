@@ -32,6 +32,7 @@ def create_launcher_app(launcher: Launcher, *, run_loop: bool = True, tick_secon
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await launcher.recover()
+        await launcher.inspect_sandbox()
         task = asyncio.create_task(_loop(launcher, tick_seconds)) if run_loop else None
         try:
             yield
@@ -66,6 +67,8 @@ def create_launcher_app(launcher: Launcher, *, run_loop: bool = True, tick_secon
             "isolation": launcher.runtime.isolation,
             "running": sorted(launcher.tasks),
             "workers": sorted(launcher.config.workers),
+            # Sandbox workers whose network may run on the rule's word ("ok"), or why not.
+            "sandbox_networks": {name: problem or "ok" for name, problem in sorted(launcher.sandbox_networks.items())},
         }
 
     @app.post("/launch")

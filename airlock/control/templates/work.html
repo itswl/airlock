@@ -48,6 +48,9 @@
   </div>
   {% if plan.evidence %}<details><summary>证据</summary><pre>{{ plan.evidence }}</pre></details>{% endif %}
   <p class="small muted">plan hash <code>{{ current.plan_hash }}</code></p>
+  {% if approvals|selectattr("approver", "equalto", "policy:sandbox")|selectattr("version", "equalto", current.version)|list %}
+  <p class="small">这一版由<strong>沙箱规则</strong>批准，不是你点的：它的每一步都在沙箱工作画像上，只在一份没有 remote 的新克隆里跑，除了模型拿不到任何凭证。跑完看下面的 diff，用不用由你决定。</p>
+  {% endif %}
 
   {% if "approve" in work.actions %}
   <div class="row" style="margin-top:12px">
@@ -197,9 +200,9 @@
 {% if approvals %}
 <details><summary>批准记录</summary>
 <table>
-  <tr><th>批准</th><th>版本</th><th>方式</th><th>时间</th><th>有效至</th><th>状态</th><th>备注</th></tr>
+  <tr><th>批准</th><th>版本</th><th>谁批准</th><th>方式</th><th>时间</th><th>有效至</th><th>状态</th><th>备注</th></tr>
   {% for a in approvals %}
-  <tr><td><code>{{ a.id }}</code></td><td>v{{ a.version }}</td><td>{{ a.via }}</td><td class="small">{{ a.at|when }}</td><td class="small">{{ a.expires_at|when }}</td><td>{{ a.status }}</td><td class="small">{{ a.note }}</td></tr>
+  <tr><td><code>{{ a.id }}</code></td><td>v{{ a.version }}</td><td>{% if a.approver == "policy:sandbox" %}沙箱规则{% else %}{{ a.approver }}{% endif %}</td><td>{{ a.via }}</td><td class="small">{{ a.at|when }}</td><td class="small">{{ a.expires_at|when }}</td><td>{{ a.status }}</td><td class="small">{{ a.note }}</td></tr>
   {% endfor %}
 </table>
 </details>

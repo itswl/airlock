@@ -22,6 +22,8 @@ from airlock.crypto import canonical_json, sha256_hex
 from airlock.runner.guard import DANGER_ONLY, bash_deny_reason
 
 REPO_TARGET = "repo:"  # a step on a worker with repositories targets repo:<name>
+# Who an approval names when the sandbox rule granted it (docs/security.md, 4b). Yours name you.
+SANDBOX_APPROVER = "policy:sandbox"
 
 
 class PlanError(ValueError):
@@ -135,6 +137,15 @@ def groups(plan: Plan) -> list[dict[str, Any]]:
 
 def targets(plan: Plan) -> list[str]:
     return sorted({step.target for step in plan.steps})
+
+
+def workers_of(plan: Plan) -> list[str]:
+    return sorted({step.worker for step in plan.steps})
+
+
+def sandbox_plan(plan: Plan, workers: Mapping[str, WorkerProfile]) -> bool:
+    """Every step runs on a worker whose profile lets the sandbox rule approve it."""
+    return all(step.worker in workers and workers[step.worker].approval == "sandbox" for step in plan.steps)
 
 
 _FENCE = re.compile(r"```(plan|json)\s*\n(.*?)\n```", re.DOTALL)

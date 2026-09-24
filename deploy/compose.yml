@@ -66,6 +66,10 @@ services:
       # The repositories workers with `repos` may change: the launcher clones from
       # here for every run and reads the start of each change back from here.
       - ${AIRLOCK_ROOT:-/opt/airlock}/repos:${AIRLOCK_ROOT:-/opt/airlock}/repos:ro
+      # The workers' credential directories, read-only and at the same path, so the launcher can
+      # check what a sandbox worker holds before it runs one on the sandbox rule's word
+      # (airlock/launcher/sandbox.py). Through the Docker socket it could read them anyway.
+      - ${AIRLOCK_ROOT:-/opt/airlock}/creds:${AIRLOCK_ROOT:-/opt/airlock}/creds:ro
     networks: [launch]
     restart: unless-stopped
 

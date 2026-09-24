@@ -19,6 +19,15 @@ RUN_LABEL = {
     "run.refused": ("启动器拒绝执行", "red"),
     "run.cancelled": ("执行已急停", "orange"),
 }
+# A run the sandbox rule approved: nobody chose it, so the card says what is left to you.
+RULE_RUN_LABEL = {
+    "run.finished": ("沙箱跑完，待你审 diff", "green"),
+    "run.failed": ("沙箱里没跑成", "red"),
+    "run.refused": ("启动器拒绝了沙箱规则的批准", "red"),
+    "run.cancelled": ("沙箱运行已急停", "orange"),
+}
+# The approver the core names when its sandbox rule approved (docs/security.md, 4b).
+SANDBOX_RULE = "policy:sandbox"
 _OPENERS = ("\\", "<", "[", "]")
 
 
@@ -69,12 +78,34 @@ def for_event(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     if event in ("plan.ready", "plan.revised"):
         version = payload.get("version")
         risk = str(payload.get("risk") or "")
+        if payload.get("approved_by") == SANDBOX_RULE:
+            blocks = [
+                escape(payload.get("lead")),
+                f"**方案**：{escape(payload.get('summary'))}",
+                "由沙箱规则批准，已经开始跑：只在一份没有 remote 的新克隆里改，除了模型拿不到任何凭证。"
+                "跑完会发改动，diff 在控制台审，用不用由你决定。",
+            ]
+            return card(
+                f"沙箱里自动执行 v{version}：{title}",
+                "wathet",
+                blocks,
+                link=link,
+                link_text="看方案",
+                note=f"{work} · 在这张卡片下回复并 @ 机器人：调查员会按你的话接着查或修订方案。",
+            )
         head = "方案已修订" if event == "plan.revised" else "方案待批准"
+        allowance = payload.get("allowance") or {}
+        why_yours = {
+            "allowance": f"沙箱工作画像 {escape(allowance.get('worker'))} 过去 24 小时已由规则批准 "
+            f"{escape(allowance.get('used'))} 次（上限 {escape(allowance.get('limit'))}），这一版等你批准。",
+            "approved_once": "这一版沙箱规则已经批准过一次；要再跑一遍，在控制台批准。",
+        }
         blocks = [
             escape(payload.get("lead")),
             f"**方案**：{escape(payload.get('summary'))}",
             f"**风险**：{escape(risk or '未标注')}　**版本**：v{escape(version)}",
             "相对上一版有改动，批准前看一下差异。" if payload.get("changed") else "",
+            why_yours.get(str(payload.get("rule_declined") or ""), ""),
         ]
         return card(
             f"{head} v{version}：{title}",
@@ -98,7 +129,8 @@ def for_event(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         head = "方案没通过校验" if event == "plan.invalid" else "调查出错"
         return card(f"{head}：{title}", "red", [escape(why)[:1500]], link=link, note=work)
     if event in RUN_LABEL:
-        label, tone = RUN_LABEL[event]
+        ruled = payload.get("approved_by") == SANDBOX_RULE
+        label, tone = (RULE_RUN_LABEL if ruled else RUN_LABEL)[event]
         lines = []
         for index, group in enumerate(payload.get("groups") or [], start=1):
             line = f"第 {index} 组 {escape(group.get('worker'))}：{escape(group.get('status'))}"
@@ -111,7 +143,8 @@ def for_event(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
             lines.append(line)
         reason = payload.get("reason")
         blocks = ["\n".join(lines), f"原因：{escape(reason)}" if reason else ""]
-        return card(f"{label}：{title}", tone, blocks, link=link, link_text="看执行记录", note=work)
+        link_text = "审 diff" if ruled and event == "run.finished" else "看执行记录"
+        return card(f"{label}：{title}", tone, blocks, link=link, link_text=link_text, note=work)
     if event in ("approval.expired", "approval.revoked"):
         what = "批准已过期，没有执行" if event == "approval.expired" else "批准已撤回"
         return card(f"{what}：{title}", "grey", [], link=link, note=work)
