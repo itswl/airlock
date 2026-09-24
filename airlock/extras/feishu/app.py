@@ -19,6 +19,8 @@ from airlock.extras.feishu.config import FeishuConfig
 from airlock.extras.feishu.lark import LarkError
 
 logger = logging.getLogger("airlock.feishu")
+# Between the pieces of a report: the platform limits how fast one chat is sent to (5 a second).
+PIECE_PAUSE_SECONDS = 0.25
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS deliveries (id TEXT PRIMARY KEY, event TEXT NOT NULL, at REAL NOT NULL, message_id TEXT);
@@ -120,7 +122,21 @@ def create_app(config: FeishuConfig, cards: Cards, *, clock: Callable[[], float]
                 "INSERT OR IGNORE INTO deliveries (id, event, at, message_id) VALUES (?,?,?,?)",
                 [delivery, event, clock(), message_id],
             )
-        return JSONResponse({"status": "sent" if card else "no card for this event", "message_id": message_id})
+        # Then the whole report, into the card's thread: the card's button opens a console a phone may not reach.
+        # A failure here is logged, not retried: the card is out, and a retry would send it twice.
+        sent = 0
+        for extra in render.report_cards(event, payload) if card is not None else []:
+            if sent:
+                time.sleep(PIECE_PAUSE_SECONDS)
+            try:
+                cards.post_for_work(str(payload.get("work_id") or ""), extra)
+                sent += 1
+            except LarkError as exc:
+                logger.warning("sending the report of %s failed after %d cards: %s", payload.get("work_id"), sent, exc)
+                break
+        return JSONResponse(
+            {"status": "sent" if card else "no card for this event", "message_id": message_id, "report_cards": sent}
+        )
 
     @app.post("/notice")
     async def notice(request: Request) -> JSONResponse:

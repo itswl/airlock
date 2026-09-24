@@ -72,6 +72,9 @@ SANDBOX_WINDOW_SECONDS = 86400
 DISPATCH_BACKOFF_SECONDS = (5, 15, 60, 180, 600)
 LAUNCH_RETRY_SECONDS = 30
 RUN_STATUSES = ("done", "failed", "refused", "cancelled")
+# How much of a report a notification carries: a subscriber may be the only place it is read (a phone).
+REPORT_CHARS = 20_000
+STEP_CHARS = 300
 
 
 @dataclass
@@ -96,6 +99,28 @@ def lead_of(prose: str, limit: int = 500) -> str:
         clean, _ = redact(re.sub(r"^#+\s*", "", text))
         return clean[:limit]
     return ""
+
+
+def report_of(prose: str, limit: int = REPORT_CHARS) -> dict[str, Any]:
+    """The whole report for a notification, credential shapes masked: the console is not always within reach.
+
+    A console on 127.0.0.1 cannot be opened from a phone, so a subscriber that
+    renders for one (the Feishu adapter) needs the text itself, not a link to it.
+    """
+    clean, _ = redact(prose or "")
+    return {"report": clean[:limit], "report_truncated": len(clean) > limit}
+
+
+def steps_of(plan: Any) -> list[dict[str, str]]:
+    """Each step in one line for a notification: who, where, and the command or the start of the task."""
+    return [
+        {
+            "worker": step.worker,
+            "target": step.target,
+            "what": redact(step.command_text if step.argv is not None else str(step.task or ""))[0][:STEP_CHARS],
+        }
+        for step in plan.steps
+    ]
 
 
 def _by_rule(approver: str) -> dict[str, str]:
@@ -514,16 +539,16 @@ class ControlPlane:
         prose = strip_plans(text)
         if prose:
             self._message(work["id"], f"investigator:{profile}", prose, via="investigation")
-        lead = lead_of(prose)
+        told = {"lead": lead_of(prose), **report_of(prose)}
         if not has_plan(text):
-            return self._answered(work, profile, usage, lead=lead)
+            return self._answered(work, profile, usage, told=told)
         try:
             plan = extract_plan(text)
             errors = validate_plan(plan, self.config.workers)
         except PlanError as exc:
             plan, errors = None, [str(exc)]
         if plan is not None and not errors:
-            return self._plan_ready(work, profile, plan, usage, lead=lead)
+            return self._plan_ready(work, profile, plan, usage, told=told)
         version = None
         if plan is not None:
             version = self._store_plan(work["id"], profile, plan, errors)
@@ -569,8 +594,13 @@ class ControlPlane:
         )
         return version
 
-    def _answered(self, work: Mapping[str, Any], profile: str, usage: Mapping[str, Any], *, lead: str = "") -> Outcome:
-        """No plan in the reply. With a plan already standing, it was an answer about that plan."""
+    def _answered(
+        self, work: Mapping[str, Any], profile: str, usage: Mapping[str, Any], *, told: Mapping[str, Any]
+    ) -> Outcome:
+        """No plan in the reply. With a plan already standing, it was an answer about that plan.
+
+        ``told`` is what the notification says of the report: its lead, and the report itself.
+        """
         target = "plan_ready" if work["current_version"] else "answered"
         state = self._settle(work, target)
         self.ledger.append(
@@ -580,11 +610,11 @@ class ControlPlane:
             data={"plan_version": work["current_version"], **usage},
         )
         if state != "queued":
-            self._notify("work.answered", work["id"], plan_version=work["current_version"], lead=lead)
+            self._notify("work.answered", work["id"], plan_version=work["current_version"], **told)
         return Outcome(200, {"status": state})
 
     def _plan_ready(
-        self, work: Mapping[str, Any], profile: str, plan: Any, usage: Mapping[str, Any], *, lead: str = ""
+        self, work: Mapping[str, Any], profile: str, plan: Any, usage: Mapping[str, Any], *, told: Mapping[str, Any]
     ) -> Outcome:
         digest = plan_hash(plan)
         current = self.plan_row(work["id"], work["current_version"]) if work["current_version"] else None
@@ -619,7 +649,8 @@ class ControlPlane:
                 summary=plan.summary,
                 risk=plan.risk,
                 changed=changed,
-                lead=lead,
+                steps=steps_of(plan),
+                **told,
                 **rule,
             )
         return Outcome(200, {"status": state, "version": version})

@@ -9,7 +9,9 @@ paged a whole company through a renderer that did not know this.
 
 from __future__ import annotations
 
+import re
 from typing import Any
+from urllib.parse import urlparse
 
 TONE = {"high": "red", "critical": "red", "medium": "orange", "low": "wathet", "info": "blue", "done": "green"}
 RISK_TONE = {"high": "red", "medium": "orange", "low": "wathet"}
@@ -29,6 +31,12 @@ RULE_RUN_LABEL = {
 # The approver the core names when its sandbox rule approved (docs/security.md, 4b).
 SANDBOX_RULE = "policy:sandbox"
 _OPENERS = ("\\", "<", "[", "]")
+# A report goes into the card's thread in pieces of this size: a phone cannot open a console on 127.0.0.1.
+REPORT_EVENTS = ("work.answered", "plan.ready", "plan.revised")
+CHUNK_CHARS = 2500
+MAX_CHUNKS = 8
+MAX_STEPS = 10
+_LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 
 def escape(text: Any) -> str:
@@ -45,6 +53,8 @@ def _md(content: str) -> dict[str, Any]:
 def _link_button(text: str, url: str) -> dict[str, Any] | None:
     if not str(url or "").startswith(("http://", "https://")):
         return None
+    if urlparse(str(url)).hostname in _LOCAL_HOSTS:
+        text += "（电脑上）"  # a console on this machine only: said on the button, not found out on a phone
     return {
         "tag": "action",
         "actions": [
@@ -68,6 +78,62 @@ def card(title: str, tone: str, blocks: list[str], *, link: str = "", link_text:
 
 
 REPLY_HINT = "在这张卡片下回复并 @ 机器人：调查员会按你的话接着查或修订方案（新版本要重新批准）。批准只在控制台。"
+IN_THREAD = "报告全文在这张卡片的话题里。"
+
+
+def _steps(payload: dict[str, Any]) -> str:
+    """The plan's steps, one line each, so a phone shows what would run."""
+    steps = [s for s in payload.get("steps") or [] if isinstance(s, dict)]
+    if not steps:
+        return ""
+    lines = [
+        f"{i}. {escape(s.get('worker'))} · {escape(s.get('target'))}：{escape(s.get('what'))}"
+        for i, s in enumerate(steps[:MAX_STEPS], start=1)
+    ]
+    if len(steps) > MAX_STEPS:
+        lines.append(f"……还有 {len(steps) - MAX_STEPS} 步")
+    return "**步骤**\n" + "\n".join(lines)
+
+
+def _chunks(text: str, size: int) -> list[str]:
+    """Pieces of at most ``size`` characters, cut between paragraphs where it can be and between lines otherwise."""
+    pieces: list[str] = []
+    current = ""
+    for paragraph in re.split(r"\n\s*\n", text):
+        for part in [paragraph[i : i + size] for i in range(0, len(paragraph), size)] or [""]:
+            joined = f"{current}\n\n{part}" if current else part
+            if len(joined) <= size:
+                current = joined
+                continue
+            if current:
+                pieces.append(current)
+            current = part
+    if current.strip():
+        pieces.append(current)
+    return pieces
+
+
+def report_cards(event: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """The whole report, as cards for the thread under the event's card. Nothing when the lead already says it all."""
+    if event not in REPORT_EVENTS:
+        return []
+    text = str(payload.get("report") or "").strip()
+    without_headings = re.sub(r"^#{1,6}\s+.*$", "", text, flags=re.M).strip()
+    if not text or without_headings == str(payload.get("lead") or "").strip():
+        return []
+    # lark_md has no headings: a heading line becomes a bold one. Everything is escaped like every other field.
+    text = re.sub(r"^#{1,6}\s+(.+?)\s*#*$", r"**\1**", text, flags=re.M)
+    chunks = _chunks(text, CHUNK_CHARS)
+    cut = bool(payload.get("report_truncated")) or len(chunks) > MAX_CHUNKS
+    chunks = chunks[:MAX_CHUNKS]
+    title = str(payload.get("title") or "工作项")
+    cards = []
+    for index, chunk in enumerate(chunks, start=1):
+        numbered = f" {index}/{len(chunks)}" if len(chunks) > 1 else ""
+        last = index == len(chunks)
+        note = "报告太长，后面没有发，全文在控制台（电脑上）。" if cut and last else ""
+        cards.append(card(f"报告全文{numbered}：{title}", "grey", [escape(chunk)], note=note))
+    return cards
 
 
 def for_event(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -75,6 +141,7 @@ def for_event(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     title = str(payload.get("title") or "工作项")
     link = str(payload.get("link") or "")
     work = f"工作项 {payload.get('work_id', '')}"
+    in_thread = IN_THREAD if report_cards(event, payload) else ""
     if event in ("plan.ready", "plan.revised"):
         version = payload.get("version")
         risk = str(payload.get("risk") or "")
@@ -82,8 +149,10 @@ def for_event(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
             blocks = [
                 escape(payload.get("lead")),
                 f"**方案**：{escape(payload.get('summary'))}",
+                _steps(payload),
                 "由沙箱规则批准，已经开始跑：只在一份没有 remote 的新克隆里改，除了模型拿不到任何凭证。"
                 "跑完会发改动，diff 在控制台审，用不用由你决定。",
+                in_thread,
             ]
             return card(
                 f"沙箱里自动执行 v{version}：{title}",
@@ -104,8 +173,10 @@ def for_event(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
             escape(payload.get("lead")),
             f"**方案**：{escape(payload.get('summary'))}",
             f"**风险**：{escape(risk or '未标注')}　**版本**：v{escape(version)}",
+            _steps(payload),
             "相对上一版有改动，批准前看一下差异。" if payload.get("changed") else "",
             why_yours.get(str(payload.get("rule_declined") or ""), ""),
+            in_thread,
         ]
         return card(
             f"{head} v{version}：{title}",
@@ -119,7 +190,10 @@ def for_event(event: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         return card(
             f"调查完成：{title}",
             "blue",
-            [escape(payload.get("lead") or payload.get("summary") or "调查员给出了结论，没有需要执行的方案。")],
+            [
+                escape(payload.get("lead") or payload.get("summary") or "调查员给出了结论，没有需要执行的方案。"),
+                in_thread,
+            ],
             link=link,
             link_text="看报告",
             note=f"{work} · {REPLY_HINT}",
