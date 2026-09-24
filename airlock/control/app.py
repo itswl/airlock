@@ -32,6 +32,8 @@ from airlock import __version__
 from airlock.config import ControlConfig
 from airlock.control import auth
 from airlock.control.intake import MAX_BODY_BYTES
+from airlock.control.memory import read as memory_read
+from airlock.control.report import OUTCOMES
 from airlock.control.service import ControlPlane, Outcome
 from airlock.crypto import PROFILE_HEADER, SignatureError, header, verify
 
@@ -175,6 +177,13 @@ def create_app(
             raise HTTPException(404, "unknown adapter")
         return reply(plane.adapter_message(name, as_json(await signed_body(request, adapter.secret))))
 
+    @app.post("/v1/adapters/{name}/rating")
+    async def adapter_rating(name: str, request: Request) -> JSONResponse:
+        adapter = config.adapters.get(name)
+        if adapter is None:
+            raise HTTPException(404, "unknown adapter")
+        return reply(plane.adapter_rating(name, as_json(await signed_body(request, adapter.secret))))
+
     @app.post("/v1/adapters/{name}/decision")
     async def adapter_decision(name: str, request: Request) -> JSONResponse:
         adapter = config.adapters.get(name)
@@ -263,7 +272,7 @@ def create_app(
         detail = plane.detail(work_id)
         if detail is None:
             raise HTTPException(404, "no such work item")
-        return page(request, "work.html", **detail, workers=config.workers)
+        return page(request, "work.html", **detail, workers=config.workers, rating=plane.rating(work_id))
 
     @app.post("/work/{work_id}/message")
     async def message(work_id: str, request: Request, text: str = Form(""), csrf: str = Form("")) -> Response:
@@ -309,6 +318,40 @@ def create_app(
     async def cancel(work_id: str, request: Request, csrf: str = Form("")) -> Response:
         checked(request, csrf)
         return back(work_id, await plane.cancel(work_id, via="web"), "已发出急停")
+
+    @app.post("/work/{work_id}/rate")
+    async def rate(
+        work_id: str, request: Request, rating: str = Form(""), note: str = Form(""), csrf: str = Form("")
+    ) -> Response:
+        checked(request, csrf)
+        return back(work_id, plane.rate(work_id, rating, note, via="web"), "已记下你的评价")
+
+    @app.get("/report", response_class=HTMLResponse)
+    async def report_page(request: Request, days: int = 7) -> HTMLResponse:
+        session(request)
+        return page(request, "report.html", report=plane.report(days), OUTCOMES=OUTCOMES)
+
+    @app.get("/report.json")
+    async def report_json(request: Request, days: int = 7) -> JSONResponse:
+        session(request)
+        return JSONResponse(plane.report(days))
+
+    @app.get("/memory", response_class=HTMLResponse)
+    async def memory_page(request: Request) -> HTMLResponse:
+        session(request)
+        profiles = sorted(config.investigators)
+        files = {name: memory_read(plane.memory_file(name)) for name in profiles}
+        decided = plane.db.all("SELECT * FROM suggestions WHERE status != 'pending' ORDER BY decided_at DESC LIMIT 30")
+        return page(request, "memory.html", pending=plane.suggestions(), decided=decided, files=files)
+
+    @app.post("/memory/{suggestion_id}/{decision}")
+    async def memory_decision(suggestion_id: int, decision: str, request: Request, csrf: str = Form("")) -> Response:
+        checked(request, csrf)
+        if decision not in ("accept", "dismiss"):
+            raise HTTPException(404, "no such decision")
+        outcome = plane.decide_suggestion(suggestion_id, accept=decision == "accept")
+        note = ("已写进记忆" if decision == "accept" else "已驳回") if outcome.ok else str(outcome.body.get("reason"))
+        return RedirectResponse(f"/memory?flash={quote(note)}", status_code=303)
 
     @app.get("/ledger", response_class=HTMLResponse)
     async def ledger(request: Request) -> HTMLResponse:

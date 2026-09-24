@@ -98,6 +98,20 @@
 {% endif %}
 {% endif %}
 
+{% if work.state not in ("queued", "investigating") %}
+<div class="card">
+  <h3 style="margin-top:0">这次调查帮上忙了吗</h3>
+  {% if rating %}<p>你的评价：<strong>{{ "有用" if rating.rating == "useful" else "没用" }}</strong>{% if rating.note %}，{{ rating.note }}{% endif %} <span class="small muted">{{ rating.at|when }} · {{ rating.via }}</span></p>{% endif %}
+  <form method="post" action="/work/{{ work.id }}/rate" class="row">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="text" name="note" placeholder="一句话说为什么（可不填）" style="flex:1">
+    <button name="rating" value="useful">有用</button>
+    <button name="rating" value="useless">没用</button>
+  </form>
+  <p class="small muted">只进报表，不影响任何批准或预算。飞书里在这个工作项的卡片下只回「有用」或「没用」也一样。</p>
+</div>
+{% endif %}
+
 {% for run in runs %}
 <div class="card">
   <h3 style="margin-top:0">执行结果：{{ STATE_LABELS.get(run.status, run.status) }} <span class="small muted">{{ run.received_at|when }}</span></h3>

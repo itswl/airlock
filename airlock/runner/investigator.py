@@ -34,6 +34,7 @@ Configuration is the environment, because a node is a container:
     AIRLOCK_BUDGET_USD         what this node may spend in the window before it refuses new work (see
                                airlock.runner.budget); AIRLOCK_BUDGET_WINDOW_HOURS (default 24)
     AIRLOCK_PRICE_{IN,OUT,CACHE_READ,CACHE_WRITE}_PER_1M   token rates: every turn is priced from its usage
+    AIRLOCK_MEMORY_FILE        facts the operator accepted (airlock.control.memory), read-only, read every run
     AIRLOCK_SKILLS             "all" or comma-separated names; skills live in <workdir>/.claude/skills
     AIRLOCK_MAX_CONCURRENT     investigations at once (default 2)
     AIRLOCK_MODEL              model name for the claude engine
@@ -124,6 +125,7 @@ class NodeConfig:
     budget_usd: float | None = None
     budget_window_hours: float = 24.0
     rates: Rates = field(default_factory=Rates)
+    memory_file: Path | None = None
 
 
 def load_node(env: Mapping[str, str] | None = None) -> NodeConfig:
@@ -163,6 +165,7 @@ def load_node(env: Mapping[str, str] | None = None) -> NodeConfig:
         budget_usd=float(env["AIRLOCK_BUDGET_USD"]) if env.get("AIRLOCK_BUDGET_USD") else None,
         budget_window_hours=float(env.get("AIRLOCK_BUDGET_WINDOW_HOURS") or 24),
         rates=rates_from(env),
+        memory_file=Path(env["AIRLOCK_MEMORY_FILE"]) if env.get("AIRLOCK_MEMORY_FILE") else None,
     )
 
 
@@ -194,7 +197,26 @@ the only way anything you conclude becomes an action, so make it one the person
 can approve in a single reading."""
     if config.instructions.strip():
         rules += "\n\n## This profile\n\n" + config.instructions.strip()
+    remembered = _remembered(config.memory_file)
+    if remembered:
+        rules += (
+            "\n\n## Remembered\n\nFacts earlier investigations proposed and the operator accepted. They were true "
+            "when accepted; check one again before a plan depends on it.\n\n" + remembered
+        )
     return rules
+
+
+MEMORY_LIMIT = 16_000
+
+
+def _remembered(path: Path | None) -> str:
+    """The profile's accepted facts, read fresh every run: an accept on the console applies to the next run."""
+    if path is None:
+        return ""
+    try:
+        return path.read_text(encoding="utf-8")[:MEMORY_LIMIT].strip()
+    except OSError:
+        return ""
 
 
 def _workers_section(workers: list[Mapping[str, Any]]) -> str:
@@ -289,7 +311,13 @@ Rules the plan is checked against before anyone sees it:
 
 If nothing should change, say so and include no plan. If the person asked a
 question about the current plan, answer it; send the whole plan again only if
-you change it, and say what you changed."""
+you change it, and say what you changed.
+
+If you learned a lasting fact about this environment that later investigations
+should start from — not about this incident, about the systems — put it on its
+own line at the very end: `MEMORY-SUGGESTION: <the fact, one line>`. At most a
+few. The operator decides whether it is remembered; you cannot write it
+yourself."""
     )
     return "\n\n".join(parts)
 

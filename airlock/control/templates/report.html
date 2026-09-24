@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}报表 · airlock{% endblock %}
+{% block body %}
+<h1>报表 <span class="small muted">最近 {{ report.window.days }} 天 · <a href="/report?days=7">7 天</a> · <a href="/report?days=30">30 天</a> · <a href="/report.json?days={{ report.window.days }}">JSON</a></span></h1>
+<p class="muted small">你说的（评价）和你做的（结果）分开算。结果不用你点：方案被批准并执行成功，是报告帮上忙最硬的证据。报表只读，不参与任何决定。</p>
+
+<div class="card">
+  <h3 style="margin-top:0">工作项 {{ report.work_items }} 个</h3>
+  <table>
+    <tr><th>结果</th><th>个数</th></tr>
+    {% for key, label in OUTCOMES.items() %}{% if report.outcomes[key] %}<tr><td>{{ label }}</td><td>{{ report.outcomes[key] }}</td></tr>{% endif %}{% endfor %}
+  </table>
+  <p>你的评价：有用 {{ report.ratings.useful }} · 没用 {{ report.ratings.useless }} · 没评 {{ report.ratings.unrated }}</p>
+  <p class="small muted">来源：{% for k, v in report.by_source.items() %}{{ k }} {{ v }}{% if not loop.last %} · {% endif %}{% endfor %}　调查画像：{% for k, v in report.by_investigator.items() %}{{ k }} {{ v }}{% if not loop.last %} · {% endif %}{% endfor %}</p>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0">调查和方案</h3>
+  <table>
+    <tr><td>调查轮次</td><td>{{ report.investigations.rounds }}（失败 {{ report.investigations.failed_rounds }}）</td></tr>
+    <tr><td>每轮用时中位数</td><td>{{ report.investigations.median_minutes if report.investigations.median_minutes is not none else "—" }} 分钟</td></tr>
+    <tr><td>花费</td><td>${{ "%.2f"|format(report.investigations.cost_usd) }}</td></tr>
+    <tr><td>token</td><td class="small">{% for k, v in report.investigations.tokens.items() %}{{ k }} {{ v }}{% if not loop.last %} · {% endif %}{% endfor %}</td></tr>
+    <tr><td>守卫拒绝</td><td>{{ report.investigations.refusals }} 次</td></tr>
+    <tr><td>出了方案的工作项</td><td>{{ report.plans.items_with_plan }}（第一版就通过校验 {{ report.plans.first_plan_valid }}，平均 {{ report.plans.average_versions if report.plans.average_versions is not none else "—" }} 版）</td></tr>
+    <tr><td>批准前等待中位数</td><td>{{ report.approvals.median_wait_minutes if report.approvals.median_wait_minutes is not none else "—" }} 分钟（{{ report.approvals.count }} 次批准）</td></tr>
+    <tr><td>执行</td><td>{% for k, v in report.runs.items() %}{{ k }} {{ v }}{% if not loop.last %} · {% endif %}{% else %}—{% endfor %}</td></tr>
+  </table>
+</div>
+
+<table>
+  <tr><th>时间</th><th>工作项</th><th>来源</th><th>结果</th><th>评价</th></tr>
+  {% for r in report["items"] %}
+  <tr><td class="small muted">{{ r.created_at|when }}</td><td><a href="/work/{{ r.id }}">{{ r.title }}</a></td><td class="small">{{ r.source }}</td>
+    <td>{{ OUTCOMES[r.outcome] }}</td><td>{% if r.rating == "useful" %}<span class="ok">有用</span>{% elif r.rating == "useless" %}<span class="bad">没用</span>{% else %}<span class="muted">—</span>{% endif %}</td></tr>
+  {% else %}
+  <tr><td colspan="5" class="muted">这段时间没有工作项。</td></tr>
+  {% endfor %}
+</table>
+{% endblock %}

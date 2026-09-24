@@ -128,6 +128,24 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+-- What you said about a work item's result: the latest rating (every rating is also in the ledger).
+CREATE TABLE IF NOT EXISTS ratings (
+    work_id TEXT PRIMARY KEY REFERENCES work_items(id),
+    rating TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    via TEXT NOT NULL,
+    at REAL NOT NULL
+);
+-- Facts an investigator proposed remembering (airlock.control.memory); you accept or dismiss each.
+CREATE TABLE IF NOT EXISTS suggestions (
+    id INTEGER PRIMARY KEY,
+    profile TEXT NOT NULL,
+    work_id TEXT NOT NULL REFERENCES work_items(id),
+    at REAL NOT NULL,
+    text TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    decided_at REAL
+);
 """
 
 # A work item in one of these is finished. A new signal with the same key after

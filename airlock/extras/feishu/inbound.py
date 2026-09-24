@@ -3,6 +3,7 @@
 | the message | becomes |
 |---|---|
 | a reply under a work item's card | your message on that item (``/v1/adapters/<name>/message``); the investigator revises |
+| a reply that is only 有用 or 没用, under a work item's card | your rating of that item (``/v1/adapters/<name>/rating``) |
 | a reply under a watcher's note | a new work item (the adapter's intake source), the note as its context |
 | a new topic that @-mentions the bot | a new work item |
 | from anyone not in ``people``, from a bot, from another chat | nothing, and a log line |
@@ -29,6 +30,7 @@ from airlock.extras.feishu.config import FeishuConfig
 
 logger = logging.getLogger("airlock.feishu")
 _MENTION = re.compile(r"@_user_\d+\s*")
+RATING = re.compile(r"(有用|没用)[。.!！]*")
 
 
 def text_of(message: dict[str, Any]) -> str:
@@ -97,6 +99,20 @@ def _handle(
     if card is not None and card["kind"] == "work" and card["work_id"]:
         if not config.adapter_url:
             return "ignored: no adapter door configured"
+        verdict = RATING.fullmatch(text)
+        if verdict is not None:
+            # Only the bare word is a rating; "没用，再查查" is a message to the investigator.
+            status, reply = _post(
+                client,
+                f"{config.adapter_url}/rating",
+                config.adapter_secret,
+                {
+                    "work_id": card["work_id"],
+                    "rating": "useful" if verdict.group(1) == "有用" else "useless",
+                    "platform_user": user,
+                },
+            )
+            return f"rating on {card['work_id']}: {status}" + ("" if status == 200 else f" {reply}")
         status, reply = _post(
             client,
             f"{config.adapter_url}/message",

@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}记忆 · airlock{% endblock %}
+{% block body %}
+<h1>记忆</h1>
+<p class="muted small">调查员在报告末尾用 <code>MEMORY-SUGGESTION:</code> 提议它想记住的事实。你接受的会写进这个画像的记忆文件，下次调查开始时它会读到；它自己写不了。</p>
+
+<h2>待你决定</h2>
+{% for s in pending %}
+<div class="card">
+  <p><strong>{{ s.profile }}</strong>：{{ s.text }}</p>
+  <p class="small muted">{{ s.at|when }} · 来自 <a href="/work/{{ s.work_id }}">工作项 {{ s.work_id }}</a></p>
+  <form method="post" action="/memory/{{ s.id }}/accept" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button>接受，写进记忆</button></form>
+  <form method="post" action="/memory/{{ s.id }}/dismiss" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button>驳回</button></form>
+</div>
+{% else %}
+<p class="muted">没有待决定的提议。</p>
+{% endfor %}
+
+<h2>现在的记忆</h2>
+{% for name, text in files.items() %}
+<div class="card"><h3 style="margin-top:0">{{ name }}</h3>{% if text %}<pre>{{ text }}</pre>{% else %}<p class="muted">还没有。</p>{% endif %}</div>
+{% endfor %}
+
+{% if decided %}
+<h2>最近的决定</h2>
+<table>
+  <tr><th>时间</th><th>画像</th><th>内容</th><th>决定</th></tr>
+  {% for s in decided %}<tr><td class="small muted">{{ s.decided_at|when }}</td><td>{{ s.profile }}</td><td>{{ s.text }}</td><td>{{ "接受" if s.status == "accepted" else "驳回" }}</td></tr>{% endfor %}
+</table>
+{% endif %}
+{% endblock %}

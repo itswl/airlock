@@ -82,6 +82,7 @@ services:
       AIRLOCK_MCP_CONFIG: /etc/airlock/mcp-infra.json            # read-only credentials, or a server behind mcp-gate
       AIRLOCK_MCP_ALLOWED: ${AIRLOCK_INFRA_MCP_ALLOWED:-}
       AIRLOCK_SKILLS: all
+      AIRLOCK_MEMORY_FILE: /memory/infra.md                      # facts you accepted on the console (airlock.control.memory)
       HTTPS_PROXY: http://egress:8888
       HTTP_PROXY: http://egress:8888
       NO_PROXY: control,mcp-gate
@@ -96,6 +97,8 @@ services:
       - ${AIRLOCK_ROOT:-/opt/airlock}/creds/investigator-infra:/creds:ro   # READ-ONLY identities only
       - ${AIRLOCK_ROOT:-/opt/airlock}/work/infra:/work
       - ${AIRLOCK_ROOT:-/opt/airlock}/state/infra:/state
+      # Read-only: the control plane writes a profile's memory when you accept a suggestion; the agent never does.
+      - ${AIRLOCK_ROOT:-/opt/airlock}/data/memory:/memory:ro
     read_only: true
     tmpfs: [/tmp]
     cap_drop: [ALL]

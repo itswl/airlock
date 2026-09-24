@@ -6,6 +6,8 @@ is how you tell a clock that stopped from a quiet afternoon. ``--once`` runs
 one round now and exits. ``--force`` runs it outside the hours too.
 ``--dry-run`` scans and judges but delivers nothing and moves no cursor, so you
 can read what a round would have said.
+``--report DAYS`` reads the record back: rounds that ran the model and rounds
+that did not, tasks and notes raised, signals dropped, deliveries failed, cost.
 
 Each round is kept twice. ``rounds.jsonl`` is a chained record: scan size,
 offered subjects, the judge's signals and what was dropped, each delivery and
@@ -34,7 +36,7 @@ from airlock.extras.watch.jira import http_fetch
 from airlock.extras.watch.judge import default_engine, judge, summary
 from airlock.extras.watch.mcp import McpClient
 from airlock.extras.watch.scan import Scanner, in_window, write_atomically
-from airlock.runner.recorder import Recorder
+from airlock.runner.recorder import Recorder, read_lines
 
 logger = logging.getLogger("airlock.watch")
 
@@ -65,6 +67,8 @@ def run_round(
         outcome = "quiet" if force or in_window(config.schedule, tick) else "outside"
         if not dry_run:
             status(config, tick_at=tick, outcome=outcome)
+            if outcome == "quiet":
+                record.write("round.quiet")  # counted by --report: a round that cost nothing
         return {"outcome": outcome}
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(scan.at))
     judgement = asyncio.run(
@@ -103,6 +107,31 @@ def run_round(
     return result
 
 
+def report(path: Path, days: int, *, now: float | None = None) -> dict[str, Any]:
+    """Rounds over the last ``days``: how many ran the model, what they raised, what was dropped, what failed."""
+    since = (time.time() if now is None else now) - days * 86400
+    lines = [line for line in read_lines(path) if float(line.get("ts") or 0) >= since]
+    rounds = [line["data"] for line in lines if line.get("kind") == "round"]
+    deliveries = [d for r in rounds for d in r.get("deliveries") or []]
+    # A task is delivered twice (to the intake, then as its card): count it once, at the intake.
+    signals = [d for d in deliveries if d.get("door") == "tasks" or d.get("kind") == "note"]
+    return {
+        "days": days,
+        "quiet_rounds": sum(1 for line in lines if line.get("kind") == "round.quiet"),
+        "judged_rounds": len(rounds),
+        "failed_rounds": sum(1 for r in rounds if r.get("outcome") == "error"),
+        "tasks": sum(1 for d in signals if d.get("kind") == "task"),
+        "notes": sum(1 for d in signals if d.get("kind") == "note"),
+        "high": sum(1 for d in signals if d.get("level") == "high"),
+        "dropped_signals": sum(len((r.get("judge") or {}).get("dropped") or []) for r in rounds),
+        "failed_deliveries": sum(1 for d in deliveries if not d.get("ok")),
+        "cost_usd": round(sum(float((r.get("judge") or {}).get("cost_usd") or 0) for r in rounds), 4),
+        "average_digest_bytes": round(sum(r.get("digest_bytes") or 0 for r in rounds) / len(rounds))
+        if rounds
+        else None,
+    }
+
+
 def seconds_to_next(every_minutes: int, now: float) -> float:
     """Until the next multiple of ``every_minutes`` since local midnight, so restarts do not shift the grid."""
     local = time.localtime(now)
@@ -117,6 +146,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--once", action="store_true", help="one round now, then exit")
     parser.add_argument("--force", action="store_true", help="ignore the working hours")
     parser.add_argument("--dry-run", action="store_true", help="scan and judge; deliver nothing, move no cursor")
+    parser.add_argument("--report", type=int, metavar="DAYS", help="what the last DAYS of rounds did, from the record")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     try:
@@ -127,6 +157,9 @@ def main(argv: list[str] | None = None) -> int:
     if config.schedule.tz:
         os.environ["TZ"] = config.schedule.tz
         time.tzset()
+    if args.report:
+        print(json.dumps(report(config.state_dir / "rounds.jsonl", args.report), ensure_ascii=False, indent=2))
+        return 0
     config.state_dir.mkdir(parents=True, exist_ok=True)
     chat = (
         McpClient(

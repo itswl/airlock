@@ -31,13 +31,15 @@ import time
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 from airlock.config import ControlConfig
-from airlock.control import intake
+from airlock.control import intake, memory
 from airlock.control.outbox import Outbox
+from airlock.control.report import build_report
 from airlock.control.store import ACTIONS, CONCLUDED, REOPENS, SCHEMA, TERMINAL
 from airlock.crypto import PROFILE_HEADER, SignatureError, canonical_json, sha256_hex, sign
 from airlock.db import Database
@@ -46,6 +48,7 @@ from airlock.plans import PlanError, extract_plan, has_plan, plan_hash, strip_pl
 from airlock.runner.gate import redact
 
 logger = logging.getLogger("airlock.control")
+RATINGS = ("useful", "useless")
 
 DISPATCH_BACKOFF_SECONDS = (5, 15, 60, 180, 600)
 LAUNCH_RETRY_SECONDS = 30
@@ -475,8 +478,9 @@ class ControlPlane:
         if refused is not None:
             return refused
         assert work is not None
-        text = str(payload.get("text") or "")
+        text, suggested = memory.lift(str(payload.get("text") or ""))
         usage = {k: payload[k] for k in ("cost_usd", "turns", "refusals", "usage") if k in payload}
+        self._suggest(profile, work["id"], suggested)
         if payload.get("session"):
             self.db.execute(
                 "UPDATE work_items SET engine_session = ? WHERE id = ?", [str(payload["session"])[:200], work["id"]]
@@ -501,7 +505,7 @@ class ControlPlane:
             "plan.invalid",
             work_id=work["id"],
             actor=f"investigator:{profile}",
-            data={"errors": errors, "version": version},
+            data={"errors": errors, "version": version, **usage},
         )
         if work["auto_revisions"] < self.config.max_auto_revisions:
             feedback = (
@@ -835,6 +839,88 @@ class ControlPlane:
         return self.operator_message(
             str(payload.get("work_id") or ""), str(payload.get("text") or ""), via=f"adapter:{adapter_name}"
         )
+
+    def adapter_rating(self, adapter_name: str, payload: Mapping[str, Any]) -> Outcome:
+        refused = self._adapter_operator(adapter_name, payload)
+        if refused is not None:
+            return refused
+        return self.rate(
+            str(payload.get("work_id") or ""),
+            str(payload.get("rating") or ""),
+            str(payload.get("note") or ""),
+            via=f"adapter:{adapter_name}",
+        )
+
+    # ------------------------------------------------------------------ what you say about results
+
+    def rate(self, work_id: str, rating: str, note: str = "", *, via: str = "web") -> Outcome:
+        """Useful or useless: the latest word per work item, every word in the ledger. It decides nothing."""
+        if rating not in RATINGS:
+            return Outcome(400, {"reason": f"a rating is one of {', '.join(RATINGS)}"})
+        work = self.work(work_id)
+        if work is None:
+            return Outcome(404, {"reason": "no such work item"})
+        clean, _ = redact(note.strip()[:500])
+        self.db.execute(
+            "INSERT INTO ratings (work_id, rating, note, via, at) VALUES (?,?,?,?,?) "
+            "ON CONFLICT(work_id) DO UPDATE SET rating = excluded.rating, note = excluded.note, "
+            "via = excluded.via, at = excluded.at",
+            [work_id, rating, clean, via, self.clock()],
+        )
+        self.ledger.append(
+            "work.rated", work_id=work_id, actor=self.config.operator.name, data={"rating": rating, "via": via}
+        )
+        return Outcome(200, {"status": "rated", "rating": rating})
+
+    def rating(self, work_id: str) -> dict[str, Any] | None:
+        return self.db.one("SELECT * FROM ratings WHERE work_id = ?", [work_id])
+
+    # ------------------------------------------------------------------ what an investigator wants remembered
+
+    def memory_file(self, profile: str) -> Path:
+        return memory.path_for(Path(self.config.db_path).parent, profile)
+
+    def _suggest(self, profile: str, work_id: str, facts: list[str]) -> None:
+        for fact in facts:
+            clean, _ = redact(fact)
+            if not clean.strip() or self.db.one(
+                "SELECT 1 FROM suggestions WHERE profile = ? AND text = ? AND status = 'pending'", [profile, clean]
+            ):
+                continue
+            self.db.execute(
+                "INSERT INTO suggestions (profile, work_id, at, text) VALUES (?,?,?,?)",
+                [profile, work_id, self.clock(), clean],
+            )
+            self.ledger.append(
+                "memory.suggested", work_id=work_id, actor=f"investigator:{profile}", data={"chars": len(clean)}
+            )
+
+    def suggestions(self, status: str = "pending") -> list[dict[str, Any]]:
+        return self.db.all("SELECT * FROM suggestions WHERE status = ? ORDER BY id DESC LIMIT 200", [status])
+
+    def decide_suggestion(self, suggestion_id: int, *, accept: bool) -> Outcome:
+        row = self.db.one("SELECT * FROM suggestions WHERE id = ?", [suggestion_id])
+        if row is None or row["status"] != "pending":
+            return Outcome(404, {"reason": "no such pending suggestion"})
+        if accept:
+            try:
+                memory.append(self.memory_file(row["profile"]), row["text"], work_id=row["work_id"], at=self.clock())
+            except (OSError, ValueError) as exc:
+                return Outcome(409, {"reason": str(exc)})
+        status = "accepted" if accept else "dismissed"
+        self.db.execute(
+            "UPDATE suggestions SET status = ?, decided_at = ? WHERE id = ?", [status, self.clock(), suggestion_id]
+        )
+        self.ledger.append(
+            f"memory.{status}",
+            work_id=row["work_id"],
+            actor=self.config.operator.name,
+            data={"profile": row["profile"], "text_sha256": sha256_hex(row["text"].encode())},
+        )
+        return Outcome(200, {"status": status})
+
+    def report(self, days: int = 7) -> dict[str, Any]:
+        return build_report(self.db, self.config.operator.name, days=max(1, min(int(days), 365)), now=self.clock())
 
     def adapter_decision(self, adapter_name: str, payload: Mapping[str, Any]) -> Outcome:
         refused = self._adapter_operator(adapter_name, payload)
